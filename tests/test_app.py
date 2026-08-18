@@ -18,10 +18,17 @@ def test_app_builds(tmp_path: Path):
 
 def test_recording_prompts_have_hiragana_readings():
     config = load_config()
+    prompts = {prompt.id: prompt for prompt in config.candidates}
 
     assert config.candidates[0].reading == "けさはあおいそらをみながら、えきまでゆっくりあるきました。"
-    assert config.candidates[1].text.endswith("時計がはいっています。")
-    assert config.candidates[1].reading.endswith("とけいがはいっています。")
+    assert prompts["c02"].text.endswith("時計がはいっています。")
+    assert prompts["c02"].reading.endswith("とけいがはいっています。")
+    assert prompts["c09"].text.endswith("窓をあけました。")
+    assert prompts["c09"].reading.endswith("まどをあけました。")
+    assert prompts["c10"].text.startswith("しちがつにじゅうさんにちの")
+    assert prompts["c10"].reading.startswith("しちがつにじゅうさんにちの")
+    assert "ほそいみち" in prompts["c11"].text
+    assert "ほそいみち" in prompts["c11"].reading
     assert config.anchors[0].reading
 
 
