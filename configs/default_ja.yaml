@@ -32,7 +32,7 @@ candidate_prompts:
     text: 今朝は青い空を見ながら、駅までゆっくり歩きました。
   - id: c02
     category: objects-short
-    text: この箱には、赤い鍵と小さな時計が入っています。
+    text: この箱には、赤い鍵と小さな時計がはいっています。
   - id: c03
     category: question
     text: すみません、次の角を右に曲がれば、市役所に着きますか？

@@ -20,6 +20,8 @@ def test_recording_prompts_have_hiragana_readings():
     config = load_config()
 
     assert config.candidates[0].reading == "けさはあおいそらをみながら、えきまでゆっくりあるきました。"
+    assert config.candidates[1].text.endswith("時計がはいっています。")
+    assert config.candidates[1].reading.endswith("とけいがはいっています。")
     assert config.anchors[0].reading
 
 
