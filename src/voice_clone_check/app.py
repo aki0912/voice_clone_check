@@ -3,12 +3,14 @@ from __future__ import annotations
 import html
 import itertools
 import json
+import re
 import threading
 from pathlib import Path
 from typing import Any
 
 import gradio as gr
 
+from .config import Prompt
 from .reports import ReportBuilder
 from .scoring import rank_candidates
 from .service import ExperimentService
@@ -28,11 +30,11 @@ CSS = """
 .vcc-experiment-message:empty { display:none; }
 .vcc-prompt { border:1px solid #dfe3ee; border-radius:14px; padding:14px 16px;
   background:#fff; min-height:112px; }
-.vcc-prompt-text { color:var(--vcc-ink); font-size:17px; line-height:1.75;
+.vcc-prompt-text { color:var(--vcc-ink); font-size:18px; line-height:2.35;
   overflow-wrap:anywhere; }
-.vcc-prompt-reading { color:var(--vcc-muted); font-size:14px; line-height:1.7;
-  margin-top:8px; overflow-wrap:anywhere; }
-.vcc-prompt-reading strong { color:var(--vcc-ink); }
+.vcc-prompt-text ruby { color:var(--vcc-ink); ruby-position:over; ruby-align:center; }
+.vcc-prompt-text rt { color:var(--vcc-muted); font-size:.58em; font-weight:500;
+  letter-spacing:.04em; }
 .vcc-score-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; }
 .vcc-score { border:1px solid #dfe3ee; border-radius:14px; padding:14px; background:white; }
 .vcc-score strong { display:block; color:var(--vcc-ink); font-size:19px; }
@@ -47,6 +49,23 @@ CSS = """
   border:1px solid #dfe3ee; border-radius:14px; background:#f4f6fb; }
 footer { display:none !important; }
 """
+
+
+KANJI_PATTERN = re.compile(r"[一-龯々〆ヵヶ〇]")
+
+
+def ruby_markup(prompt: Prompt) -> str:
+    parts = []
+    for base, reading in prompt.reading_segments:
+        escaped_base = html.escape(base)
+        if base != reading and KANJI_PATTERN.search(base):
+            parts.append(
+                f"<ruby>{escaped_base}<rp>（</rp><rt>{html.escape(reading)}</rt>"
+                "<rp>）</rp></ruby>"
+            )
+        else:
+            parts.append(escaped_base)
+    return "".join(parts)
 
 
 def select_listening_pairs(
@@ -94,9 +113,8 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
         prompt = prompts[prompt_id]
         return (
             '<div class="vcc-prompt">'
-            f'<div class="vcc-prompt-text">{html.escape(prompt.text)}</div>'
-            f'<div class="vcc-prompt-reading"><strong>よみ：</strong>'
-            f'{html.escape(prompt.reading)}</div></div>'
+            f'<div class="vcc-prompt-text" lang="ja">{ruby_markup(prompt)}</div>'
+            "</div>"
         )
 
     def select_candidate(prompt_id: str):

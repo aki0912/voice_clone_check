@@ -1,6 +1,11 @@
 from pathlib import Path
 
-from voice_clone_check.app import build_app, report_preview, select_listening_pairs
+from voice_clone_check.app import (
+    build_app,
+    report_preview,
+    ruby_markup,
+    select_listening_pairs,
+)
 from voice_clone_check.config import load_config
 from voice_clone_check.service import ExperimentService
 
@@ -16,6 +21,16 @@ def test_recording_prompts_have_hiragana_readings():
 
     assert config.candidates[0].reading == "けさはあおいそらをみながら、えきまでゆっくりあるきました。"
     assert config.anchors[0].reading
+
+
+def test_recording_prompts_render_readings_as_ruby():
+    prompt = load_config().candidates[0]
+
+    markup = ruby_markup(prompt)
+
+    assert "<ruby>今朝<rp>（</rp><rt>けさ</rt><rp>）</rp></ruby>" in markup
+    assert "<ruby>駅<rp>（</rp><rt>えき</rt><rp>）</rp></ruby>" in markup
+    assert "<ruby>は" not in markup
 
 
 def test_listening_uses_one_generation_per_candidate_pair_and_text():

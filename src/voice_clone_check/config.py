@@ -15,6 +15,7 @@ class Prompt:
     id: str
     text: str
     reading: str
+    reading_segments: tuple[tuple[str, str], ...]
     category: str = ""
 
 
@@ -53,21 +54,27 @@ class ExperimentConfig:
 def _prompts(items: list[dict[str, Any]]) -> tuple[Prompt, ...]:
     converter = kakasi()
 
-    def reading(item: dict[str, Any]) -> str:
+    def readings(item: dict[str, Any]) -> tuple[str, tuple[tuple[str, str], ...]]:
         configured = str(item.get("reading", "")).strip()
         if configured:
-            return configured
-        return "".join(token["hira"] for token in converter.convert(str(item["text"])))
+            return configured, ((str(item["text"]), configured),)
+        tokens = converter.convert(str(item["text"]))
+        return (
+            "".join(token["hira"] for token in tokens),
+            tuple((token["orig"], token["hira"]) for token in tokens),
+        )
 
-    return tuple(
-        Prompt(
+    def prompt(item: dict[str, Any]) -> Prompt:
+        reading, segments = readings(item)
+        return Prompt(
             id=str(item["id"]),
             text=str(item["text"]),
-            reading=reading(item),
+            reading=reading,
+            reading_segments=segments,
             category=str(item.get("category", "")),
         )
-        for item in items
-    )
+
+    return tuple(prompt(item) for item in items)
 
 
 def load_config(path: str | Path | None = None) -> ExperimentConfig:
