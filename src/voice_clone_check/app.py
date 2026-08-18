@@ -24,6 +24,12 @@ CSS = """
 .vcc-hero p { margin: 0; color: var(--vcc-muted); max-width: 760px; }
 .vcc-step { color: var(--vcc-accent); font-size: 12px; font-weight: 750;
   text-transform: uppercase; letter-spacing: .08em; }
+.vcc-prompt { border:1px solid #dfe3ee; border-radius:14px; padding:14px 16px;
+  background:#fff; min-height:112px; }
+.vcc-prompt-text { font-size:17px; line-height:1.75; overflow-wrap:anywhere; }
+.vcc-prompt-reading { color:var(--vcc-muted); font-size:14px; line-height:1.7;
+  margin-top:8px; overflow-wrap:anywhere; }
+.vcc-prompt-reading strong { color:var(--vcc-ink); }
 .vcc-score-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; }
 .vcc-score { border:1px solid #dfe3ee; border-radius:14px; padding:14px; background:white; }
 .vcc-score strong { display:block; font-size:19px; }
@@ -42,6 +48,19 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
 
     candidate_text = {item.id: item.text for item in config.candidates}
     anchor_text = {item.id: item.text for item in config.anchors}
+    prompts = {item.id: item for item in (*config.candidates, *config.anchors)}
+
+    def prompt_card(prompt_id: str) -> str:
+        prompt = prompts[prompt_id]
+        return (
+            '<div class="vcc-prompt">'
+            f'<div class="vcc-prompt-text">{html.escape(prompt.text)}</div>'
+            f'<div class="vcc-prompt-reading"><strong>よみ：</strong>'
+            f'{html.escape(prompt.reading)}</div></div>'
+        )
+
+    def select_candidate(prompt_id: str):
+        return prompt_card(prompt_id), gr.update(value=1)
 
     def experiment_choices() -> list[tuple[str, str]]:
         return [
@@ -414,10 +433,13 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                         candidate_select = gr.Dropdown(
                             label="候補",
                             choices=[
-                                (f"{item.id} · {item.text}", item.id)
+                                (f"{item.id} · {item.category}", item.id)
                                 for item in config.candidates
                             ],
                             value=config.candidates[0].id,
+                        )
+                        candidate_prompt = gr.HTML(
+                            prompt_card(config.candidates[0].id)
                         )
                         candidate_take = gr.Radio(
                             label="テイク", choices=[1, 2], value=1
@@ -437,11 +459,12 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                         anchor_select = gr.Dropdown(
                             label="アンカー",
                             choices=[
-                                (f"{item.id} · {item.text}", item.id)
+                                (item.id, item.id)
                                 for item in config.anchors
                             ],
                             value=config.anchors[0].id,
                         )
+                        anchor_prompt = gr.HTML(prompt_card(config.anchors[0].id))
                         anchor_audio = gr.Audio(
                             label="録音またはWAVを選択",
                             sources=["microphone", "upload"],
@@ -543,6 +566,16 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             lambda value: (recording_table(value), readiness(value)),
             inputs=[experiment_select],
             outputs=[recordings_frame, recording_readiness],
+        )
+        candidate_select.change(
+            select_candidate,
+            inputs=[candidate_select],
+            outputs=[candidate_prompt, candidate_take],
+        )
+        anchor_select.change(
+            prompt_card,
+            inputs=[anchor_select],
+            outputs=[anchor_prompt],
         )
         save_candidate_button.click(
             save_candidate,

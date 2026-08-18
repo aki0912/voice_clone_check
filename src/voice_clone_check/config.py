@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from pykakasi import kakasi
 
 from .paths import default_config_path
 
@@ -13,6 +14,7 @@ from .paths import default_config_path
 class Prompt:
     id: str
     text: str
+    reading: str
     category: str = ""
 
 
@@ -49,10 +51,19 @@ class ExperimentConfig:
 
 
 def _prompts(items: list[dict[str, Any]]) -> tuple[Prompt, ...]:
+    converter = kakasi()
+
+    def reading(item: dict[str, Any]) -> str:
+        configured = str(item.get("reading", "")).strip()
+        if configured:
+            return configured
+        return "".join(token["hira"] for token in converter.convert(str(item["text"])))
+
     return tuple(
         Prompt(
             id=str(item["id"]),
             text=str(item["text"]),
+            reading=reading(item),
             category=str(item.get("category", "")),
         )
         for item in items
@@ -69,4 +80,3 @@ def load_config(path: str | Path | None = None) -> ExperimentConfig:
         anchors=_prompts(raw["anchor_prompts"]),
         evaluations=_prompts(raw["evaluation_prompts"]),
     )
-
