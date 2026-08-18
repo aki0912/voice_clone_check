@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from voice_clone_check.app import (
+    CSS,
     build_app,
     report_preview,
     ruby_markup,
@@ -14,6 +15,16 @@ def test_app_builds(tmp_path: Path):
     service = ExperimentService(root=tmp_path / "experiments")
     app = build_app(service)
     assert app is not None
+
+
+def test_custom_styles_include_readable_dark_mode_tokens_and_buttons():
+    assert "body.dark" in CSS
+    assert "--vcc-ink: #f8fafc" in CSS
+    assert "--vcc-muted: #cbd5e1" in CSS
+    assert "button.record" in CSS
+    assert "button.primary" in CSS
+    assert "button:focus-visible" in CSS
+    assert "background:#fff" not in CSS
 
 
 def test_recording_prompts_have_hiragana_readings():
