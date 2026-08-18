@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from voice_clone_check.app import build_app, select_listening_pairs
+from voice_clone_check.app import build_app, report_preview, select_listening_pairs
 from voice_clone_check.config import load_config
 from voice_clone_check.service import ExperimentService
 
@@ -44,3 +44,11 @@ def test_listening_uses_one_generation_per_candidate_pair_and_text():
     assert len(pairs) == 6
     assert all(left["take"] == right["take"] == 1 for left, right in pairs)
     assert all(left["seed"] == right["seed"] == 10 for left, right in pairs)
+
+
+def test_report_preview_embeds_document_without_leaking_into_parent_page():
+    preview = report_preview("<html><body><h1>結果</h1></body></html>")
+
+    assert "<iframe" in preview
+    assert "srcdoc=" in preview
+    assert "&lt;h1&gt;結果&lt;/h1&gt;" in preview

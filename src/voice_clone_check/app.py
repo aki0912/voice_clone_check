@@ -20,20 +20,22 @@ CSS = """
 .vcc-hero { padding: 12px 16px; border-radius: 14px;
   background: linear-gradient(135deg,#f0f2ff 0%,#f8f5ff 52%,#eef8f5 100%);
   border: 1px solid #dfe3f2; margin-bottom: 8px; }
-.vcc-hero h1 { margin: 0 0 2px; font-size: clamp(21px,3vw,28px); letter-spacing: -.025em; }
+.vcc-hero h1 { margin: 0 0 2px; color:var(--vcc-ink);
+  font-size: clamp(21px,3vw,28px); letter-spacing: -.025em; }
 .vcc-hero p { margin: 0; color: var(--vcc-muted); max-width: 920px; font-size:13px; }
 .vcc-experiment-bar { align-items:end; gap:8px; margin-bottom:4px; }
 .vcc-experiment-bar button { min-width:112px; }
 .vcc-experiment-message:empty { display:none; }
 .vcc-prompt { border:1px solid #dfe3ee; border-radius:14px; padding:14px 16px;
   background:#fff; min-height:112px; }
-.vcc-prompt-text { font-size:17px; line-height:1.75; overflow-wrap:anywhere; }
+.vcc-prompt-text { color:var(--vcc-ink); font-size:17px; line-height:1.75;
+  overflow-wrap:anywhere; }
 .vcc-prompt-reading { color:var(--vcc-muted); font-size:14px; line-height:1.7;
   margin-top:8px; overflow-wrap:anywhere; }
 .vcc-prompt-reading strong { color:var(--vcc-ink); }
 .vcc-score-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; }
 .vcc-score { border:1px solid #dfe3ee; border-radius:14px; padding:14px; background:white; }
-.vcc-score strong { display:block; font-size:19px; }
+.vcc-score strong { display:block; color:var(--vcc-ink); font-size:19px; }
 .vcc-score span { color:var(--vcc-muted); font-size:12px; }
 .vcc-bar { height:7px; background:#e9ecf5; border-radius:9px; margin-top:9px; overflow:hidden; }
 .vcc-bar i { display:block; height:100%; background:linear-gradient(90deg,#4856d8,#8b62dd); }
@@ -41,6 +43,8 @@ CSS = """
   margin:8px 0 12px; overflow:hidden; }
 .vcc-listening-progress i { display:block; height:100%;
   background:linear-gradient(90deg,#4856d8,#8b62dd); }
+.vcc-report-preview iframe { width:100%; height:min(72vh,760px); min-height:520px;
+  border:1px solid #dfe3ee; border-radius:14px; background:#f4f6fb; }
 footer { display:none !important; }
 """
 
@@ -66,6 +70,14 @@ def select_listening_pairs(
             if left_rows and right_rows:
                 pairs.append((left_rows[0], right_rows[0]))
     return pairs
+
+
+def report_preview(document: str) -> str:
+    return (
+        '<div class="vcc-report-preview">'
+        '<iframe title="レポートプレビュー" sandbox="allow-same-origin" '
+        f'srcdoc="{html.escape(document, quote=True)}"></iframe></div>'
+    )
 
 
 def build_app(service: ExperimentService | None = None) -> gr.Blocks:
@@ -432,10 +444,11 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             service.experiment_dir(experiment_id),
         ).build(experiment_id, weights)
         return (
+            report_preview(paths["html"].read_text(encoding="utf-8")),
             str(paths["html"]),
             str(paths["csv"]),
             str(paths["json"]),
-            "レポートを更新しました。",
+            "レポートを更新しました。下の画面で確認できます。",
         )
 
     with gr.Blocks(title="Voice Clone Check") as app:
@@ -581,13 +594,17 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
 
             with gr.Tab("5. レポート"):
                 gr.Markdown(
-                    "現在の重みと試聴結果で、HTML・CSV・JSONをまとめて更新します。HTMLには上位候補の代表音声も埋め込まれます。"
+                    "現在の重みと試聴結果でレポートを更新し、この画面に表示します。必要な場合だけ各形式をダウンロードできます。"
                 )
-                export_button = gr.Button("レポートを書き出す", variant="primary")
+                export_button = gr.Button("レポートを更新・表示", variant="primary")
                 export_status = gr.Markdown()
-                html_file = gr.File(label="HTMLレポート")
-                csv_file = gr.File(label="全生成データ CSV")
-                json_file = gr.File(label="集計 JSON")
+                report_frame = gr.HTML(
+                    "<p>「レポートを更新・表示」を押すと、ここに結果が表示されます。</p>"
+                )
+                with gr.Accordion("ダウンロード", open=False):
+                    html_file = gr.File(label="HTMLレポート")
+                    csv_file = gr.File(label="全生成データ CSV")
+                    json_file = gr.File(label="集計 JSON")
 
         create_button.click(
             create_experiment,
@@ -685,6 +702,6 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 intelligibility_weight,
                 automatic_weight,
             ],
-            outputs=[html_file, csv_file, json_file, export_status],
+            outputs=[report_frame, html_file, csv_file, json_file, export_status],
         )
     return app
