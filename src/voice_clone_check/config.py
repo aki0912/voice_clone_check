@@ -50,6 +50,10 @@ class ExperimentConfig:
     def takes_per_candidate(self) -> int:
         return int(self.raw["generation"]["takes_per_candidate"])
 
+    @property
+    def candidate_generation(self) -> dict[str, Any]:
+        return dict(self.raw.get("candidate_generation", {}))
+
 
 def _prompts(items: list[dict[str, Any]]) -> tuple[Prompt, ...]:
     converter = kakasi()
@@ -77,13 +81,17 @@ def _prompts(items: list[dict[str, Any]]) -> tuple[Prompt, ...]:
     return tuple(prompt(item) for item in items)
 
 
-def load_config(path: str | Path | None = None) -> ExperimentConfig:
-    config_path = Path(path) if path else default_config_path()
-    with config_path.open("r", encoding="utf-8") as handle:
-        raw = yaml.safe_load(handle)
+def config_from_raw(raw: dict[str, Any]) -> ExperimentConfig:
     return ExperimentConfig(
         raw=raw,
         candidates=_prompts(raw["candidate_prompts"]),
         anchors=_prompts(raw["anchor_prompts"]),
         evaluations=_prompts(raw["evaluation_prompts"]),
     )
+
+
+def load_config(path: str | Path | None = None) -> ExperimentConfig:
+    config_path = Path(path) if path else default_config_path()
+    with config_path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+    return config_from_raw(raw)

@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS experiments (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     config_json TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'recorded',
+    parent_experiment_id TEXT REFERENCES experiments(id),
     status TEXT NOT NULL DEFAULT 'recording',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -39,6 +41,12 @@ CREATE TABLE IF NOT EXISTS recordings (
     snr_db REAL NOT NULL,
     quality_ok INTEGER NOT NULL,
     warnings_json TEXT NOT NULL,
+    origin TEXT NOT NULL DEFAULT 'recorded',
+    model_id TEXT,
+    generation_seed INTEGER,
+    source_sha256 TEXT,
+    transcript TEXT,
+    cer REAL,
     created_at TEXT NOT NULL,
     UNIQUE(experiment_id, kind, prompt_id, take)
 );
@@ -77,6 +85,25 @@ CREATE TABLE IF NOT EXISTS listening_votes (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS reference_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id TEXT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+    prompt_id TEXT NOT NULL,
+    source_recording_id INTEGER NOT NULL REFERENCES recordings(id) ON DELETE CASCADE,
+    seed INTEGER NOT NULL,
+    model_id TEXT NOT NULL,
+    output_path TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error TEXT,
+    duration REAL,
+    quality_ok INTEGER,
+    transcript TEXT,
+    cer REAL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(experiment_id, prompt_id, source_recording_id, seed, model_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_recordings_experiment
 ON recordings(experiment_id);
 
@@ -95,6 +122,34 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate(connection)
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        migrations = {
+            "experiments": {
+                "mode": "TEXT NOT NULL DEFAULT 'recorded'",
+                "parent_experiment_id": "TEXT",
+            },
+            "recordings": {
+                "origin": "TEXT NOT NULL DEFAULT 'recorded'",
+                "model_id": "TEXT",
+                "generation_seed": "INTEGER",
+                "source_sha256": "TEXT",
+                "transcript": "TEXT",
+                "cer": "REAL",
+            },
+        }
+        for table, columns in migrations.items():
+            existing = {
+                row["name"]
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, declaration in columns.items():
+                if name not in existing:
+                    connection.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                    )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -108,16 +163,26 @@ class Database:
             connection.close()
 
     def create_experiment(
-        self, experiment_id: str, name: str, config: dict[str, Any]
+        self,
+        experiment_id: str,
+        name: str,
+        config: dict[str, Any],
+        mode: str = "recorded",
+        parent_experiment_id: str | None = None,
     ) -> None:
         timestamp = now_iso()
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO experiments(id, name, config_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO experiments(
+                    id, name, config_json, mode, parent_experiment_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (experiment_id, name, json.dumps(config, ensure_ascii=False), timestamp, timestamp),
+                (
+                    experiment_id, name, json.dumps(config, ensure_ascii=False),
+                    mode, parent_experiment_id, timestamp, timestamp,
+                ),
             )
 
     def experiment(self, experiment_id: str) -> sqlite3.Row | None:
@@ -134,6 +199,16 @@ class Database:
                 ).fetchall()
             )
 
+    def child_experiments(self, experiment_id: str) -> list[sqlite3.Row]:
+        with self.connect() as connection:
+            return list(
+                connection.execute(
+                    "SELECT * FROM experiments WHERE parent_experiment_id = ? "
+                    "ORDER BY created_at DESC",
+                    (experiment_id,),
+                ).fetchall()
+            )
+
     def set_experiment_status(self, experiment_id: str, status: str) -> None:
         with self.connect() as connection:
             connection.execute(
@@ -146,9 +221,18 @@ class Database:
             "experiment_id", "kind", "prompt_id", "take", "text", "raw_path",
             "processed_path", "sha256", "duration", "rms_dbfs", "peak_dbfs",
             "clipping_ratio", "silence_ratio", "snr_db", "quality_ok",
-            "warnings_json", "created_at",
+            "warnings_json", "origin", "model_id", "generation_seed",
+            "source_sha256", "transcript", "cer", "created_at",
         )
-        params = [values[column] for column in columns]
+        defaults: dict[str, Any] = {
+            "origin": "recorded",
+            "model_id": None,
+            "generation_seed": None,
+            "source_sha256": None,
+            "transcript": None,
+            "cer": None,
+        }
+        params = [values.get(column, defaults.get(column)) for column in columns]
         with self.connect() as connection:
             connection.execute(
                 f"""
@@ -167,6 +251,12 @@ class Database:
                     snr_db=excluded.snr_db,
                     quality_ok=excluded.quality_ok,
                     warnings_json=excluded.warnings_json,
+                    origin=excluded.origin,
+                    model_id=excluded.model_id,
+                    generation_seed=excluded.generation_seed,
+                    source_sha256=excluded.source_sha256,
+                    transcript=excluded.transcript,
+                    cer=excluded.cer,
                     created_at=excluded.created_at
                 """,
                 params,
@@ -194,6 +284,121 @@ class Database:
         query += " ORDER BY kind, prompt_id, take"
         with self.connect() as connection:
             return list(connection.execute(query, params).fetchall())
+
+    def recording(self, recording_id: int) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT * FROM recordings WHERE id = ?", (recording_id,)
+            ).fetchone()
+
+    def recording_slot(
+        self, experiment_id: str, kind: str, prompt_id: str, take: int
+    ) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT * FROM recordings WHERE experiment_id=? AND kind=? "
+                "AND prompt_id=? AND take=?",
+                (experiment_id, kind, prompt_id, take),
+            ).fetchone()
+
+    def update_recording_analysis(
+        self,
+        recording_id: int,
+        *,
+        transcript: str,
+        cer: float,
+        quality_ok: bool,
+        warnings: list[str],
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE recordings SET transcript=?, cer=?, quality_ok=?, "
+                "warnings_json=? WHERE id=?",
+                (
+                    transcript,
+                    cer,
+                    int(quality_ok),
+                    json.dumps(warnings, ensure_ascii=False),
+                    recording_id,
+                ),
+            )
+
+    def delete_synthetic_recordings(self, experiment_id: str) -> list[str]:
+        with self.connect() as connection:
+            attempt_paths = [
+                row["output_path"]
+                for row in connection.execute(
+                    "SELECT output_path FROM reference_attempts WHERE experiment_id=?",
+                    (experiment_id,),
+                ).fetchall()
+            ]
+            generation_paths = [
+                row["output_path"]
+                for row in connection.execute(
+                    "SELECT g.output_path FROM generations g JOIN recordings r "
+                    "ON r.id=g.recording_id WHERE r.experiment_id=? "
+                    "AND r.origin='synthetic'",
+                    (experiment_id,),
+                ).fetchall()
+            ]
+            recording_paths = [
+                path
+                for row in connection.execute(
+                    "SELECT raw_path, processed_path FROM recordings "
+                    "WHERE experiment_id=? AND origin='synthetic'",
+                    (experiment_id,),
+                ).fetchall()
+                for path in (row["raw_path"], row["processed_path"])
+            ]
+            connection.execute(
+                "DELETE FROM recordings WHERE experiment_id=? AND origin='synthetic'",
+                (experiment_id,),
+            )
+            connection.execute(
+                "DELETE FROM reference_attempts WHERE experiment_id=?",
+                (experiment_id,),
+            )
+        return generation_paths + recording_paths + attempt_paths
+
+    def reference_attempt(
+        self,
+        experiment_id: str,
+        prompt_id: str,
+        source_recording_id: int,
+        seed: int,
+        model_id: str,
+    ) -> sqlite3.Row | None:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT * FROM reference_attempts WHERE experiment_id=? "
+                "AND prompt_id=? AND source_recording_id=? AND seed=? AND model_id=?",
+                (experiment_id, prompt_id, source_recording_id, seed, model_id),
+            ).fetchone()
+
+    def save_reference_attempt(self, values: dict[str, Any]) -> None:
+        timestamp = now_iso()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO reference_attempts(
+                    experiment_id, prompt_id, source_recording_id, seed, model_id,
+                    output_path, status, error, duration, quality_ok, transcript, cer,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(experiment_id, prompt_id, source_recording_id, seed, model_id)
+                DO UPDATE SET output_path=excluded.output_path, status=excluded.status,
+                    error=excluded.error, duration=excluded.duration,
+                    quality_ok=excluded.quality_ok, transcript=excluded.transcript,
+                    cer=excluded.cer, updated_at=excluded.updated_at
+                """,
+                (
+                    values["experiment_id"], values["prompt_id"],
+                    values["source_recording_id"], values["seed"], values["model_id"],
+                    values["output_path"], values["status"], values.get("error"),
+                    values.get("duration"), values.get("quality_ok"),
+                    values.get("transcript"), values.get("cer"), timestamp, timestamp,
+                ),
+            )
 
     def prepare_generations(
         self,

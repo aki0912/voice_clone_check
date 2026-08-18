@@ -8,7 +8,7 @@ from typing import Any
 
 from jinja2 import Template
 
-from .config import ExperimentConfig
+from .config import ExperimentConfig, config_from_raw
 from .db import Database
 from .scoring import rank_candidates
 
@@ -48,7 +48,7 @@ REPORT_TEMPLATE = Template(
 <body><main>
   <header>
     <h1>{{ name }}</h1>
-    <p>Qwen3-TTS 日本語参照セリフ探索結果</p>
+    <p>Qwen3-TTS 日本語参照セリフ探索結果 — {{ mode_label }}</p>
     <p>完了音声 {{ completed }}件 ／ 失敗判定 {{ failed }}件</p>
   </header>
   <section class="card">
@@ -69,6 +69,24 @@ REPORT_TEMPLATE = Template(
     {% endfor %}
     </tbody></table>
   </section>
+  {% if comparison %}
+  <section class="card">
+    <h2>合成事前選定との順位比較</h2>
+    <p>最終判断では、実録音検証の順位とブラインド試聴を優先してください。</p>
+    <table><thead><tr>
+      <th>候補</th><th>事前選定</th><th>実録音検証</th><th>順位変動</th>
+      <th>事前スコア</th><th>検証スコア</th>
+    </tr></thead><tbody>
+    {% for row in comparison %}<tr>
+      <td>{{ row.candidate_id }} — {{ texts[row.candidate_id] }}</td>
+      <td>{{ row.screening_rank }}</td><td>{{ row.validation_rank }}</td>
+      <td>{{ '%+d'|format(row.screening_rank - row.validation_rank) }}</td>
+      <td>{{ '%.3f'|format(row.screening_score) }}</td>
+      <td>{{ '%.3f'|format(row.validation_score) }}</td>
+    </tr>{% endfor %}
+    </tbody></table>
+  </section>
+  {% endif %}
   {% if clips %}
   <section class="card"><h2>上位候補のサンプル</h2><div class="clips">
     {% for clip in clips %}<div class="clip">
@@ -97,6 +115,17 @@ class ReportBuilder:
         if not experiment:
             raise ValueError("実験が見つかりません")
         generations = [dict(row) for row in self.db.generations(experiment_id)]
+        recordings = [dict(row) for row in self.db.recordings(experiment_id)]
+        exported_recordings = []
+        for row in recordings:
+            exported = dict(row)
+            for field in ("raw_path", "processed_path"):
+                path = Path(str(exported.get(field, "")))
+                try:
+                    exported[field] = str(path.relative_to(self.experiment_dir))
+                except ValueError:
+                    exported[field] = path.name
+            exported_recordings.append(exported)
         exported_generations = []
         for row in generations:
             exported = dict(row)
@@ -116,6 +145,35 @@ class ReportBuilder:
             votes,
             bootstrap_samples=int(weights["bootstrap_samples"]),
         )
+        comparison: list[dict[str, Any]] = []
+        if experiment["parent_experiment_id"]:
+            parent = self.db.experiment(experiment["parent_experiment_id"])
+            if parent:
+                parent_config = config_from_raw(json.loads(parent["config_json"]))
+                parent_ranking = rank_candidates(
+                    [
+                        dict(row)
+                        for row in self.db.generations(parent["id"], complete_only=True)
+                    ],
+                    parent_config.raw["ranking"],
+                    [dict(row) for row in self.db.votes(parent["id"])],
+                    bootstrap_samples=int(
+                        parent_config.raw["ranking"]["bootstrap_samples"]
+                    ),
+                )
+                parent_by_id = {row["candidate_id"]: row for row in parent_ranking}
+                for current in ranking:
+                    previous = parent_by_id.get(current["candidate_id"])
+                    if previous:
+                        comparison.append(
+                            {
+                                "candidate_id": current["candidate_id"],
+                                "screening_rank": previous["rank"],
+                                "validation_rank": current["rank"],
+                                "screening_score": previous["final_score"],
+                                "validation_score": current["final_score"],
+                            }
+                        )
         report_dir = self.experiment_dir / "reports"
         report_dir.mkdir(parents=True, exist_ok=True)
 
@@ -137,8 +195,10 @@ class ReportBuilder:
             },
             "weights": weights,
             "ranking": ranking,
+            "recordings": exported_recordings,
             "generations": exported_generations,
             "votes": votes,
+            "comparison": comparison,
         }
         json_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -173,11 +233,17 @@ class ReportBuilder:
         html_path.write_text(
             REPORT_TEMPLATE.render(
                 name=experiment["name"],
+                mode_label={
+                    "recorded": "全候補を実録音",
+                    "synthetic": "合成音声による事前選定",
+                    "validation": "上位候補の実録音検証",
+                }.get(experiment["mode"], experiment["mode"]),
                 completed=sum(row["status"] == "complete" for row in generations),
                 failed=sum(bool(row["failed"]) for row in generations),
                 ranking=ranking,
                 texts=text_map,
                 clips=clips,
+                comparison=comparison,
             ),
             encoding="utf-8",
         )
