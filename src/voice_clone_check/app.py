@@ -17,13 +17,14 @@ from .service import ExperimentService
 CSS = """
 :root { --vcc-accent: #4856d8; --vcc-ink: #172033; --vcc-muted: #68738a; }
 .gradio-container { max-width: 1220px !important; color: var(--vcc-ink); }
-.vcc-hero { padding: 24px 26px; border-radius: 20px;
+.vcc-hero { padding: 12px 16px; border-radius: 14px;
   background: linear-gradient(135deg,#f0f2ff 0%,#f8f5ff 52%,#eef8f5 100%);
-  border: 1px solid #dfe3f2; margin-bottom: 14px; }
-.vcc-hero h1 { margin: 0 0 7px; font-size: clamp(27px,4vw,42px); letter-spacing: -.035em; }
-.vcc-hero p { margin: 0; color: var(--vcc-muted); max-width: 760px; }
-.vcc-step { color: var(--vcc-accent); font-size: 12px; font-weight: 750;
-  text-transform: uppercase; letter-spacing: .08em; }
+  border: 1px solid #dfe3f2; margin-bottom: 8px; }
+.vcc-hero h1 { margin: 0 0 2px; font-size: clamp(21px,3vw,28px); letter-spacing: -.025em; }
+.vcc-hero p { margin: 0; color: var(--vcc-muted); max-width: 920px; font-size:13px; }
+.vcc-experiment-bar { align-items:end; gap:8px; margin-bottom:4px; }
+.vcc-experiment-bar button { min-width:112px; }
+.vcc-experiment-message:empty { display:none; }
 .vcc-prompt { border:1px solid #dfe3ee; border-radius:14px; padding:14px 16px;
   background:#fff; min-height:112px; }
 .vcc-prompt-text { font-size:17px; line-height:1.75; overflow-wrap:anywhere; }
@@ -398,13 +399,12 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
         gr.HTML(
             """
             <section class="vcc-hero">
-              <div class="vcc-step">Local voice experiment</div>
               <h1>Voice Clone Check</h1>
               <p>12種類の日本語セリフを同じ条件で比べ、本人らしさ・自然さ・読みの正確さから、Qwen3-TTSに最適な参照音声を探します。</p>
             </section>
             """
         )
-        with gr.Row():
+        with gr.Row(elem_classes="vcc-experiment-bar"):
             experiment_select = gr.Dropdown(
                 label="実験",
                 choices=experiment_choices(),
@@ -412,14 +412,13 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 scale=3,
             )
             refresh_button = gr.Button("一覧を更新", scale=1)
-        with gr.Row():
             experiment_name = gr.Textbox(
                 label="新しい実験名",
                 placeholder="例: 内蔵マイク・自然な会話調",
                 scale=3,
             )
             create_button = gr.Button("新しい実験を作成", variant="primary", scale=1)
-        experiment_message = gr.Markdown()
+        experiment_message = gr.Markdown(elem_classes="vcc-experiment-message")
 
         with gr.Tabs():
             with gr.Tab("1. 収録"):
