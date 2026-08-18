@@ -17,36 +17,104 @@ from .service import ExperimentService
 
 
 CSS = """
-:root { --vcc-accent: #4856d8; --vcc-ink: #172033; --vcc-muted: #68738a; }
+:root {
+  color-scheme: light dark;
+  --vcc-accent: #4856d8;
+  --vcc-accent-end: #8b62dd;
+  --vcc-ink: #172033;
+  --vcc-muted: #59647a;
+  --vcc-surface: #ffffff;
+  --vcc-border: #cbd3e3;
+  --vcc-track: #e5eaf5;
+  --vcc-report-surface: #f4f6fb;
+  --vcc-hero-start: #f0f2ff;
+  --vcc-hero-middle: #f8f5ff;
+  --vcc-hero-end: #eef8f5;
+  --vcc-focus: #4f46e5;
+}
+body.dark {
+  color-scheme: dark;
+  --vcc-accent: #818cf8;
+  --vcc-accent-end: #c084fc;
+  --vcc-ink: #f8fafc;
+  --vcc-muted: #cbd5e1;
+  --vcc-surface: #18181b;
+  --vcc-border: #52525b;
+  --vcc-track: #3f3f46;
+  --vcc-report-surface: #09090b;
+  --vcc-hero-start: #17172e;
+  --vcc-hero-middle: #211a32;
+  --vcc-hero-end: #122925;
+  --vcc-focus: #a5b4fc;
+}
 .gradio-container { max-width: 1220px !important; color: var(--vcc-ink); }
 .vcc-hero { padding: 12px 16px; border-radius: 14px;
-  background: linear-gradient(135deg,#f0f2ff 0%,#f8f5ff 52%,#eef8f5 100%);
-  border: 1px solid #dfe3f2; margin-bottom: 8px; }
+  background: linear-gradient(135deg,var(--vcc-hero-start) 0%,
+    var(--vcc-hero-middle) 52%,var(--vcc-hero-end) 100%);
+  border: 1px solid var(--vcc-border); margin-bottom: 8px; }
 .vcc-hero h1 { margin: 0 0 2px; color:var(--vcc-ink);
   font-size: clamp(21px,3vw,28px); letter-spacing: -.025em; }
 .vcc-hero p { margin: 0; color: var(--vcc-muted); max-width: 920px; font-size:13px; }
 .vcc-experiment-bar { align-items:end; gap:8px; margin-bottom:4px; }
 .vcc-experiment-bar button { min-width:112px; }
 .vcc-experiment-message:empty { display:none; }
-.vcc-prompt { border:1px solid #dfe3ee; border-radius:14px; padding:14px 16px;
-  background:#fff; min-height:112px; }
+.vcc-prompt { border:1px solid var(--vcc-border); border-radius:14px; padding:14px 16px;
+  background:var(--vcc-surface); min-height:112px; }
 .vcc-prompt-text { color:var(--vcc-ink); font-size:18px; line-height:2.35;
   overflow-wrap:anywhere; }
 .vcc-prompt-text ruby { color:var(--vcc-ink); ruby-position:over; ruby-align:center; }
 .vcc-prompt-text rt { color:var(--vcc-muted); font-size:.58em; font-weight:500;
   letter-spacing:.04em; }
 .vcc-score-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; }
-.vcc-score { border:1px solid #dfe3ee; border-radius:14px; padding:14px; background:white; }
+.vcc-score { border:1px solid var(--vcc-border); border-radius:14px; padding:14px;
+  background:var(--vcc-surface); }
 .vcc-score strong { display:block; color:var(--vcc-ink); font-size:19px; }
 .vcc-score span { color:var(--vcc-muted); font-size:12px; }
-.vcc-bar { height:7px; background:#e9ecf5; border-radius:9px; margin-top:9px; overflow:hidden; }
-.vcc-bar i { display:block; height:100%; background:linear-gradient(90deg,#4856d8,#8b62dd); }
-.vcc-listening-progress { height:8px; background:#e9ecf5; border-radius:9px;
+.vcc-bar { height:7px; background:var(--vcc-track); border-radius:9px; margin-top:9px; overflow:hidden; }
+.vcc-bar i { display:block; height:100%;
+  background:linear-gradient(90deg,var(--vcc-accent),var(--vcc-accent-end)); }
+.vcc-listening-progress { height:8px; background:var(--vcc-track); border-radius:9px;
   margin:8px 0 12px; overflow:hidden; }
 .vcc-listening-progress i { display:block; height:100%;
-  background:linear-gradient(90deg,#4856d8,#8b62dd); }
+  background:linear-gradient(90deg,var(--vcc-accent),var(--vcc-accent-end)); }
 .vcc-report-preview iframe { width:100%; height:min(72vh,760px); min-height:520px;
-  border:1px solid #dfe3ee; border-radius:14px; background:#f4f6fb; }
+  border:1px solid var(--vcc-border); border-radius:14px;
+  background:var(--vcc-report-surface); }
+
+/* Keep action labels at AA contrast in both themes. */
+.gradio-container button.primary {
+  color: #ffffff !important;
+  background-color: #c2410c !important;
+  border-color: #ea580c !important;
+}
+.gradio-container button.stop {
+  color: #ffffff !important;
+  background-color: #b91c1c !important;
+  border-color: #ef4444 !important;
+}
+.gradio-container button.primary:hover { background-color: #9a3412 !important; }
+.gradio-container button.stop:hover { background-color: #991b1b !important; }
+
+/* Gradio's audio controls use button variants with their own foreground colors. */
+body.dark .gradio-container button.secondary,
+body.dark .gradio-container button.record,
+body.dark .gradio-container button.upload-button {
+  color: #f8fafc !important;
+  background-color: #3f3f46 !important;
+  border-color: #71717a !important;
+}
+body.dark .gradio-container button.secondary:hover,
+body.dark .gradio-container button.record:hover,
+body.dark .gradio-container button.upload-button:hover {
+  background-color: #52525b !important;
+}
+.gradio-container button:focus-visible,
+.gradio-container input:focus-visible,
+.gradio-container textarea:focus-visible,
+.gradio-container [role="tab"]:focus-visible {
+  outline: 3px solid var(--vcc-focus) !important;
+  outline-offset: 2px;
+}
 footer { display:none !important; }
 """
 
