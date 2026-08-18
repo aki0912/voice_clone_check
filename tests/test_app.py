@@ -30,6 +30,10 @@ def test_recording_prompts_render_readings_as_ruby():
 
     assert "<ruby>今朝<rp>（</rp><rt>けさ</rt><rp>）</rp></ruby>" in markup
     assert "<ruby>駅<rp>（</rp><rt>えき</rt><rp>）</rp></ruby>" in markup
+    assert "<ruby>青<rp>（</rp><rt>あお</rt><rp>）</rp></ruby>い" in markup
+    assert "<ruby>見<rp>（</rp><rt>み</rt><rp>）</rp></ruby>な" in markup
+    assert "<ruby>歩<rp>（</rp><rt>ある</rt><rp>）</rp></ruby>き" in markup
+    assert "<ruby>見な" not in markup
     assert "<ruby>は" not in markup
 
 

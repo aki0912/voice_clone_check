@@ -52,19 +52,44 @@ footer { display:none !important; }
 
 
 KANJI_PATTERN = re.compile(r"[一-龯々〆ヵヶ〇]")
+HIRAGANA_PATTERN = re.compile(r"[ぁ-ゖゝゞ]")
+
+
+def split_okurigana(base: str, reading: str) -> tuple[str, str, str]:
+    """Detach a shared trailing hiragana suffix from a ruby annotation."""
+    suffix_length = 0
+    limit = min(len(base), len(reading))
+    while suffix_length < limit:
+        base_character = base[-suffix_length - 1]
+        reading_character = reading[-suffix_length - 1]
+        if (
+            base_character != reading_character
+            or not HIRAGANA_PATTERN.fullmatch(base_character)
+        ):
+            break
+        suffix_length += 1
+    if not suffix_length:
+        return base, reading, ""
+
+    ruby_base = base[:-suffix_length]
+    ruby_reading = reading[:-suffix_length]
+    if not ruby_reading or not KANJI_PATTERN.search(ruby_base):
+        return base, reading, ""
+    return ruby_base, ruby_reading, base[-suffix_length:]
 
 
 def ruby_markup(prompt: Prompt) -> str:
     parts = []
     for base, reading in prompt.reading_segments:
-        escaped_base = html.escape(base)
         if base != reading and KANJI_PATTERN.search(base):
+            ruby_base, ruby_reading, suffix = split_okurigana(base, reading)
             parts.append(
-                f"<ruby>{escaped_base}<rp>（</rp><rt>{html.escape(reading)}</rt>"
-                "<rp>）</rp></ruby>"
+                f"<ruby>{html.escape(ruby_base)}<rp>（</rp>"
+                f"<rt>{html.escape(ruby_reading)}</rt><rp>）</rp></ruby>"
+                f"{html.escape(suffix)}"
             )
         else:
-            parts.append(escaped_base)
+            parts.append(html.escape(base))
     return "".join(parts)
 
 
