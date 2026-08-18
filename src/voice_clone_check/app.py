@@ -3,12 +3,14 @@ from __future__ import annotations
 import html
 import itertools
 import json
+import re
 import threading
 from pathlib import Path
 from typing import Any
 
 import gradio as gr
 
+from .config import Prompt
 from .reports import ReportBuilder
 from .scoring import rank_candidates
 from .service import ExperimentService
@@ -17,21 +19,109 @@ from .service import ExperimentService
 CSS = """
 :root { --vcc-accent: #4856d8; --vcc-ink: #172033; --vcc-muted: #68738a; }
 .gradio-container { max-width: 1220px !important; color: var(--vcc-ink); }
-.vcc-hero { padding: 24px 26px; border-radius: 20px;
+.vcc-hero { padding: 12px 16px; border-radius: 14px;
   background: linear-gradient(135deg,#f0f2ff 0%,#f8f5ff 52%,#eef8f5 100%);
-  border: 1px solid #dfe3f2; margin-bottom: 14px; }
-.vcc-hero h1 { margin: 0 0 7px; font-size: clamp(27px,4vw,42px); letter-spacing: -.035em; }
-.vcc-hero p { margin: 0; color: var(--vcc-muted); max-width: 760px; }
-.vcc-step { color: var(--vcc-accent); font-size: 12px; font-weight: 750;
-  text-transform: uppercase; letter-spacing: .08em; }
+  border: 1px solid #dfe3f2; margin-bottom: 8px; }
+.vcc-hero h1 { margin: 0 0 2px; color:var(--vcc-ink);
+  font-size: clamp(21px,3vw,28px); letter-spacing: -.025em; }
+.vcc-hero p { margin: 0; color: var(--vcc-muted); max-width: 920px; font-size:13px; }
+.vcc-experiment-bar { align-items:end; gap:8px; margin-bottom:4px; }
+.vcc-experiment-bar button { min-width:112px; }
+.vcc-experiment-message:empty { display:none; }
+.vcc-prompt { border:1px solid #dfe3ee; border-radius:14px; padding:14px 16px;
+  background:#fff; min-height:112px; }
+.vcc-prompt-text { color:var(--vcc-ink); font-size:18px; line-height:2.35;
+  overflow-wrap:anywhere; }
+.vcc-prompt-text ruby { color:var(--vcc-ink); ruby-position:over; ruby-align:center; }
+.vcc-prompt-text rt { color:var(--vcc-muted); font-size:.58em; font-weight:500;
+  letter-spacing:.04em; }
 .vcc-score-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; }
 .vcc-score { border:1px solid #dfe3ee; border-radius:14px; padding:14px; background:white; }
-.vcc-score strong { display:block; font-size:19px; }
+.vcc-score strong { display:block; color:var(--vcc-ink); font-size:19px; }
 .vcc-score span { color:var(--vcc-muted); font-size:12px; }
 .vcc-bar { height:7px; background:#e9ecf5; border-radius:9px; margin-top:9px; overflow:hidden; }
 .vcc-bar i { display:block; height:100%; background:linear-gradient(90deg,#4856d8,#8b62dd); }
+.vcc-listening-progress { height:8px; background:#e9ecf5; border-radius:9px;
+  margin:8px 0 12px; overflow:hidden; }
+.vcc-listening-progress i { display:block; height:100%;
+  background:linear-gradient(90deg,#4856d8,#8b62dd); }
+.vcc-report-preview iframe { width:100%; height:min(72vh,760px); min-height:520px;
+  border:1px solid #dfe3ee; border-radius:14px; background:#f4f6fb; }
 footer { display:none !important; }
 """
+
+
+KANJI_PATTERN = re.compile(r"[一-龯々〆ヵヶ〇]")
+HIRAGANA_PATTERN = re.compile(r"[ぁ-ゖゝゞ]")
+
+
+def split_okurigana(base: str, reading: str) -> tuple[str, str, str]:
+    """Detach a shared trailing hiragana suffix from a ruby annotation."""
+    suffix_length = 0
+    limit = min(len(base), len(reading))
+    while suffix_length < limit:
+        base_character = base[-suffix_length - 1]
+        reading_character = reading[-suffix_length - 1]
+        if (
+            base_character != reading_character
+            or not HIRAGANA_PATTERN.fullmatch(base_character)
+        ):
+            break
+        suffix_length += 1
+    if not suffix_length:
+        return base, reading, ""
+
+    ruby_base = base[:-suffix_length]
+    ruby_reading = reading[:-suffix_length]
+    if not ruby_reading or not KANJI_PATTERN.search(ruby_base):
+        return base, reading, ""
+    return ruby_base, ruby_reading, base[-suffix_length:]
+
+
+def ruby_markup(prompt: Prompt) -> str:
+    parts = []
+    for base, reading in prompt.reading_segments:
+        if base != reading and KANJI_PATTERN.search(base):
+            ruby_base, ruby_reading, suffix = split_okurigana(base, reading)
+            parts.append(
+                f"<ruby>{html.escape(ruby_base)}<rp>（</rp>"
+                f"<rt>{html.escape(ruby_reading)}</rt><rp>）</rp></ruby>"
+                f"{html.escape(suffix)}"
+            )
+        else:
+            parts.append(html.escape(base))
+    return "".join(parts)
+
+
+def select_listening_pairs(
+    rows: list[dict[str, Any]],
+    candidate_ids: list[str],
+    evaluation_ids: list[str],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Choose one deterministic generation for each candidate pair and text."""
+    by_candidate_and_evaluation: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (row["prompt_id"], row["eval_id"])
+        by_candidate_and_evaluation.setdefault(key, []).append(row)
+    for choices in by_candidate_and_evaluation.values():
+        choices.sort(key=lambda row: (row["take"], row["seed"], row["id"]))
+
+    pairs = []
+    for left, right in itertools.combinations(candidate_ids, 2):
+        for evaluation_id in evaluation_ids:
+            left_rows = by_candidate_and_evaluation.get((left, evaluation_id), [])
+            right_rows = by_candidate_and_evaluation.get((right, evaluation_id), [])
+            if left_rows and right_rows:
+                pairs.append((left_rows[0], right_rows[0]))
+    return pairs
+
+
+def report_preview(document: str) -> str:
+    return (
+        '<div class="vcc-report-preview">'
+        '<iframe title="レポートプレビュー" sandbox="allow-same-origin" '
+        f'srcdoc="{html.escape(document, quote=True)}"></iframe></div>'
+    )
 
 
 def build_app(service: ExperimentService | None = None) -> gr.Blocks:
@@ -42,6 +132,18 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
 
     candidate_text = {item.id: item.text for item in config.candidates}
     anchor_text = {item.id: item.text for item in config.anchors}
+    prompts = {item.id: item for item in (*config.candidates, *config.anchors)}
+
+    def prompt_card(prompt_id: str) -> str:
+        prompt = prompts[prompt_id]
+        return (
+            '<div class="vcc-prompt">'
+            f'<div class="vcc-prompt-text" lang="ja">{ruby_markup(prompt)}</div>'
+            "</div>"
+        )
+
+    def select_candidate(prompt_id: str):
+        return prompt_card(prompt_id), gr.update(value=1)
 
     def experiment_choices() -> list[tuple[str, str]]:
         return [
@@ -301,38 +403,54 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             frozenset((row["generation_a"], row["generation_b"]))
             for row in service.db.votes(experiment_id)
         }
-        by_key = {
-            (row["prompt_id"], row["take"], row["eval_id"], row["seed"]): row
+        available_rows = [
+            row
             for row in rows
             if row["prompt_id"] in top and Path(row["output_path"]).exists()
-        }
-        for left, right in itertools.combinations(top, 2):
-            for take in range(1, config.takes_per_candidate + 1):
-                for evaluation in config.evaluations:
-                    for seed in config.seeds:
-                        a = by_key.get((left, take, evaluation.id, seed))
-                        b = by_key.get((right, take, evaluation.id, seed))
-                        if not a or not b:
-                            continue
-                        key = frozenset((a["id"], b["id"]))
-                        if key in previous:
-                            continue
-                        swap = (len(previous) + int(a["id"])) % 2 == 1
-                        if swap:
-                            a, b = b, a
-                        pair = {
-                            "candidate_a": a["prompt_id"],
-                            "candidate_b": b["prompt_id"],
-                            "generation_a": a["id"],
-                            "generation_b": b["id"],
-                        }
-                        return (
-                            a["output_path"],
-                            b["output_path"],
-                            pair,
-                            f"同じ文を読み上げた2音声です。本人らしさと自然さを合わせて選んでください。\n\n**評価文:** {evaluation.text}",
-                        )
-        return None, None, {}, "未評価の組み合わせがありません。結果タブで順位を確認してください。"
+        ]
+        comparisons = select_listening_pairs(
+            available_rows,
+            top,
+            [evaluation.id for evaluation in config.evaluations],
+        )
+        comparison_keys = [frozenset((a["id"], b["id"])) for a, b in comparisons]
+        completed = sum(key in previous for key in comparison_keys)
+        total = len(comparisons)
+        for a, b in comparisons:
+            key = frozenset((a["id"], b["id"]))
+            if key in previous:
+                continue
+            evaluation = next(item for item in config.evaluations if item.id == a["eval_id"])
+            swap = (completed + int(a["id"])) % 2 == 1
+            if swap:
+                a, b = b, a
+            pair = {
+                "candidate_a": a["prompt_id"],
+                "candidate_b": b["prompt_id"],
+                "generation_a": a["id"],
+                "generation_b": b["id"],
+            }
+            current = completed + 1
+            percent = current / total * 100 if total else 0
+            message = (
+                f"### 比較 {current} / {total}\n\n"
+                f'<div class="vcc-listening-progress" role="progressbar" '
+                f'aria-valuenow="{current}" aria-valuemin="0" aria-valuemax="{total}">'
+                f'<i style="width:{percent:.1f}%"></i></div>\n\n'
+                "同じ読み上げ文を、**異なる参照音声から1回ずつ生成**した比較です。"
+                "乱数やテイク違いによる同内容の比較は繰り返しません。\n\n"
+                f"**評価文:** {evaluation.text}"
+            )
+            return a["output_path"], b["output_path"], pair, message
+        if total:
+            return (
+                None,
+                None,
+                {},
+                f"### 試聴完了 {total} / {total}\n\n"
+                "すべての比較が終わりました。結果タブで順位を確認してください。",
+            )
+        return None, None, {}, "比較できる音声がありません。合成・評価の完了状況を確認してください。"
 
     def vote(experiment_id: str | None, pair: dict[str, Any], winner: str):
         if not experiment_id or not pair:
@@ -369,23 +487,23 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             service.experiment_dir(experiment_id),
         ).build(experiment_id, weights)
         return (
+            report_preview(paths["html"].read_text(encoding="utf-8")),
             str(paths["html"]),
             str(paths["csv"]),
             str(paths["json"]),
-            "レポートを更新しました。",
+            "レポートを更新しました。下の画面で確認できます。",
         )
 
     with gr.Blocks(title="Voice Clone Check") as app:
         gr.HTML(
             """
             <section class="vcc-hero">
-              <div class="vcc-step">Local voice experiment</div>
               <h1>Voice Clone Check</h1>
               <p>12種類の日本語セリフを同じ条件で比べ、本人らしさ・自然さ・読みの正確さから、Qwen3-TTSに最適な参照音声を探します。</p>
             </section>
             """
         )
-        with gr.Row():
+        with gr.Row(elem_classes="vcc-experiment-bar"):
             experiment_select = gr.Dropdown(
                 label="実験",
                 choices=experiment_choices(),
@@ -393,14 +511,13 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 scale=3,
             )
             refresh_button = gr.Button("一覧を更新", scale=1)
-        with gr.Row():
             experiment_name = gr.Textbox(
                 label="新しい実験名",
                 placeholder="例: 内蔵マイク・自然な会話調",
                 scale=3,
             )
             create_button = gr.Button("新しい実験を作成", variant="primary", scale=1)
-        experiment_message = gr.Markdown()
+        experiment_message = gr.Markdown(elem_classes="vcc-experiment-message")
 
         with gr.Tabs():
             with gr.Tab("1. 収録"):
@@ -414,10 +531,13 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                         candidate_select = gr.Dropdown(
                             label="候補",
                             choices=[
-                                (f"{item.id} · {item.text}", item.id)
+                                (f"{item.id} · {item.category}", item.id)
                                 for item in config.candidates
                             ],
                             value=config.candidates[0].id,
+                        )
+                        candidate_prompt = gr.HTML(
+                            prompt_card(config.candidates[0].id)
                         )
                         candidate_take = gr.Radio(
                             label="テイク", choices=[1, 2], value=1
@@ -437,11 +557,12 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                         anchor_select = gr.Dropdown(
                             label="アンカー",
                             choices=[
-                                (f"{item.id} · {item.text}", item.id)
+                                (item.id, item.id)
                                 for item in config.anchors
                             ],
                             value=config.anchors[0].id,
                         )
+                        anchor_prompt = gr.HTML(prompt_card(config.anchors[0].id))
                         anchor_audio = gr.Audio(
                             label="録音またはWAVを選択",
                             sources=["microphone", "upload"],
@@ -502,10 +623,10 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
 
             with gr.Tab("4. ブラインド試聴"):
                 listening_message = gr.Markdown(
-                    "自動評価の上位3候補が決まったら比較を開始してください。"
+                    "自動評価の上位3候補を、各評価文につき1回ずつ比較します。"
                 )
                 pair_state = gr.State({})
-                load_pair_button = gr.Button("次の比較を読み込む", variant="primary")
+                load_pair_button = gr.Button("比較を開始 / 次へ", variant="primary")
                 with gr.Row():
                     audio_a = gr.Audio(label="音声 A", interactive=False)
                     audio_b = gr.Audio(label="音声 B", interactive=False)
@@ -516,13 +637,17 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
 
             with gr.Tab("5. レポート"):
                 gr.Markdown(
-                    "現在の重みと試聴結果で、HTML・CSV・JSONをまとめて更新します。HTMLには上位候補の代表音声も埋め込まれます。"
+                    "現在の重みと試聴結果でレポートを更新し、この画面に表示します。必要な場合だけ各形式をダウンロードできます。"
                 )
-                export_button = gr.Button("レポートを書き出す", variant="primary")
+                export_button = gr.Button("レポートを更新・表示", variant="primary")
                 export_status = gr.Markdown()
-                html_file = gr.File(label="HTMLレポート")
-                csv_file = gr.File(label="全生成データ CSV")
-                json_file = gr.File(label="集計 JSON")
+                report_frame = gr.HTML(
+                    "<p>「レポートを更新・表示」を押すと、ここに結果が表示されます。</p>"
+                )
+                with gr.Accordion("ダウンロード", open=False):
+                    html_file = gr.File(label="HTMLレポート")
+                    csv_file = gr.File(label="全生成データ CSV")
+                    json_file = gr.File(label="集計 JSON")
 
         create_button.click(
             create_experiment,
@@ -543,6 +668,16 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             lambda value: (recording_table(value), readiness(value)),
             inputs=[experiment_select],
             outputs=[recordings_frame, recording_readiness],
+        )
+        candidate_select.change(
+            select_candidate,
+            inputs=[candidate_select],
+            outputs=[candidate_prompt, candidate_take],
+        )
+        anchor_select.change(
+            prompt_card,
+            inputs=[anchor_select],
+            outputs=[anchor_prompt],
         )
         save_candidate_button.click(
             save_candidate,
@@ -610,6 +745,6 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 intelligibility_weight,
                 automatic_weight,
             ],
-            outputs=[html_file, csv_file, json_file, export_status],
+            outputs=[report_frame, html_file, csv_file, json_file, export_status],
         )
     return app
