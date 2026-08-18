@@ -37,8 +37,35 @@ CSS = """
 .vcc-score span { color:var(--vcc-muted); font-size:12px; }
 .vcc-bar { height:7px; background:#e9ecf5; border-radius:9px; margin-top:9px; overflow:hidden; }
 .vcc-bar i { display:block; height:100%; background:linear-gradient(90deg,#4856d8,#8b62dd); }
+.vcc-listening-progress { height:8px; background:#e9ecf5; border-radius:9px;
+  margin:8px 0 12px; overflow:hidden; }
+.vcc-listening-progress i { display:block; height:100%;
+  background:linear-gradient(90deg,#4856d8,#8b62dd); }
 footer { display:none !important; }
 """
+
+
+def select_listening_pairs(
+    rows: list[dict[str, Any]],
+    candidate_ids: list[str],
+    evaluation_ids: list[str],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Choose one deterministic generation for each candidate pair and text."""
+    by_candidate_and_evaluation: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (row["prompt_id"], row["eval_id"])
+        by_candidate_and_evaluation.setdefault(key, []).append(row)
+    for choices in by_candidate_and_evaluation.values():
+        choices.sort(key=lambda row: (row["take"], row["seed"], row["id"]))
+
+    pairs = []
+    for left, right in itertools.combinations(candidate_ids, 2):
+        for evaluation_id in evaluation_ids:
+            left_rows = by_candidate_and_evaluation.get((left, evaluation_id), [])
+            right_rows = by_candidate_and_evaluation.get((right, evaluation_id), [])
+            if left_rows and right_rows:
+                pairs.append((left_rows[0], right_rows[0]))
+    return pairs
 
 
 def build_app(service: ExperimentService | None = None) -> gr.Blocks:
@@ -321,38 +348,54 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             frozenset((row["generation_a"], row["generation_b"]))
             for row in service.db.votes(experiment_id)
         }
-        by_key = {
-            (row["prompt_id"], row["take"], row["eval_id"], row["seed"]): row
+        available_rows = [
+            row
             for row in rows
             if row["prompt_id"] in top and Path(row["output_path"]).exists()
-        }
-        for left, right in itertools.combinations(top, 2):
-            for take in range(1, config.takes_per_candidate + 1):
-                for evaluation in config.evaluations:
-                    for seed in config.seeds:
-                        a = by_key.get((left, take, evaluation.id, seed))
-                        b = by_key.get((right, take, evaluation.id, seed))
-                        if not a or not b:
-                            continue
-                        key = frozenset((a["id"], b["id"]))
-                        if key in previous:
-                            continue
-                        swap = (len(previous) + int(a["id"])) % 2 == 1
-                        if swap:
-                            a, b = b, a
-                        pair = {
-                            "candidate_a": a["prompt_id"],
-                            "candidate_b": b["prompt_id"],
-                            "generation_a": a["id"],
-                            "generation_b": b["id"],
-                        }
-                        return (
-                            a["output_path"],
-                            b["output_path"],
-                            pair,
-                            f"同じ文を読み上げた2音声です。本人らしさと自然さを合わせて選んでください。\n\n**評価文:** {evaluation.text}",
-                        )
-        return None, None, {}, "未評価の組み合わせがありません。結果タブで順位を確認してください。"
+        ]
+        comparisons = select_listening_pairs(
+            available_rows,
+            top,
+            [evaluation.id for evaluation in config.evaluations],
+        )
+        comparison_keys = [frozenset((a["id"], b["id"])) for a, b in comparisons]
+        completed = sum(key in previous for key in comparison_keys)
+        total = len(comparisons)
+        for a, b in comparisons:
+            key = frozenset((a["id"], b["id"]))
+            if key in previous:
+                continue
+            evaluation = next(item for item in config.evaluations if item.id == a["eval_id"])
+            swap = (completed + int(a["id"])) % 2 == 1
+            if swap:
+                a, b = b, a
+            pair = {
+                "candidate_a": a["prompt_id"],
+                "candidate_b": b["prompt_id"],
+                "generation_a": a["id"],
+                "generation_b": b["id"],
+            }
+            current = completed + 1
+            percent = current / total * 100 if total else 0
+            message = (
+                f"### 比較 {current} / {total}\n\n"
+                f'<div class="vcc-listening-progress" role="progressbar" '
+                f'aria-valuenow="{current}" aria-valuemin="0" aria-valuemax="{total}">'
+                f'<i style="width:{percent:.1f}%"></i></div>\n\n'
+                "同じ読み上げ文を、**異なる参照音声から1回ずつ生成**した比較です。"
+                "乱数やテイク違いによる同内容の比較は繰り返しません。\n\n"
+                f"**評価文:** {evaluation.text}"
+            )
+            return a["output_path"], b["output_path"], pair, message
+        if total:
+            return (
+                None,
+                None,
+                {},
+                f"### 試聴完了 {total} / {total}\n\n"
+                "すべての比較が終わりました。結果タブで順位を確認してください。",
+            )
+        return None, None, {}, "比較できる音声がありません。合成・評価の完了状況を確認してください。"
 
     def vote(experiment_id: str | None, pair: dict[str, Any], winner: str):
         if not experiment_id or not pair:
@@ -524,10 +567,10 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
 
             with gr.Tab("4. ブラインド試聴"):
                 listening_message = gr.Markdown(
-                    "自動評価の上位3候補が決まったら比較を開始してください。"
+                    "自動評価の上位3候補を、各評価文につき1回ずつ比較します。"
                 )
                 pair_state = gr.State({})
-                load_pair_button = gr.Button("次の比較を読み込む", variant="primary")
+                load_pair_button = gr.Button("比較を開始 / 次へ", variant="primary")
                 with gr.Row():
                     audio_a = gr.Audio(label="音声 A", interactive=False)
                     audio_b = gr.Audio(label="音声 B", interactive=False)
