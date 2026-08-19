@@ -3,6 +3,7 @@ from pathlib import Path
 from voice_clone_check.app import (
     CSS,
     build_app,
+    candidate_reference_status,
     report_preview,
     ruby_markup,
     select_listening_pairs,
@@ -41,6 +42,45 @@ def test_source_audio_supports_browser_recording(tmp_path: Path):
     assert not saved_components[0]["props"]["interactive"]
 
 
+def test_app_has_candidate_reference_listening_player(tmp_path: Path):
+    service = ExperimentService(root=tmp_path / "experiments")
+    app = build_app(service)
+    config = app.get_config_file()
+    players = [
+        component
+        for component in config["components"]
+        if component.get("props", {}).get("label") == "選択中の合成候補音声"
+    ]
+
+    assert len(players) == 1
+    assert not players[0]["props"]["interactive"]
+
+
+def test_candidate_reference_status_shows_generation_metadata():
+    recording = {
+        "quality_ok": 1,
+        "warnings_json": "[]",
+        "transcript": "候補音声の認識結果です。",
+        "cer": 0.02,
+        "generation_seed": 9109,
+        "model_id": "test/qwen3-tts",
+        "duration": 5.25,
+        "snr_db": 31.5,
+    }
+
+    status = candidate_reference_status(
+        recording,
+        "候補の文章です。",
+        "c03",
+        2,
+    )
+
+    assert "c03 / テイク 2: 利用可能" in status
+    assert "seed: 9109" in status
+    assert "CER: 0.020" in status
+    assert "候補音声の認識結果です。" in status
+
+
 def test_source_recording_status_describes_empty_saved_and_rerecord_states():
     assert "スロット 2: 未登録" in source_recording_status(None, 2)
     recording = {
@@ -74,6 +114,20 @@ def test_custom_styles_include_readable_dark_mode_tokens_and_buttons():
     assert "button.primary" in CSS
     assert "button:focus-visible" in CSS
     assert "background:#fff" not in CSS
+
+
+def test_report_preview_height_grows_with_large_viewports():
+    assert "height:min(72vh,760px)" not in CSS
+    assert "height:calc(100dvh - 260px)" in CSS
+    assert "min-height:520px" in CSS
+
+
+def test_report_preview_stays_centered_in_a_bounded_wide_layout():
+    assert ".gradio-container { width:calc(100% - 32px)" in CSS
+    assert "max-width:1600px" in CSS
+    assert "margin-inline:auto" in CSS
+    assert ".vcc-report-preview { width:100%; }" in CSS
+    assert "transform:translateX(-50%)" not in CSS
 
 
 def test_recording_prompts_have_hiragana_readings():
