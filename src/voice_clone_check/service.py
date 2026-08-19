@@ -94,6 +94,20 @@ class ExperimentService:
             raise ValueError("実験が見つかりません")
         return config_from_raw(json.loads(experiment["config_json"]))
 
+    def source_recording(
+        self, experiment_id: str, slot: int
+    ) -> dict[str, Any] | None:
+        if not self.db.experiment(experiment_id):
+            raise ValueError("実験が見つかりません")
+        if slot not in {1, 2, 3}:
+            raise ValueError("元音声スロットは1〜3で指定してください")
+        row = self.db.recording_slot(
+            experiment_id, "anchor", f"source{slot:02d}", 1
+        )
+        if not row or row["origin"] != "source":
+            return None
+        return dict(row)
+
     def save_recording(
         self,
         experiment_id: str,

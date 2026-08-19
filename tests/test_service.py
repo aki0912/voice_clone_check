@@ -222,3 +222,45 @@ def test_source_transcript_mismatch_blocks_reference_generation(tmp_path: Path):
     assert result["cer"] > 0.10
     with pytest.raises(RuntimeError, match="確認済みの元音声"):
         service.generate_candidate_references(experiment_id, smoke=True)
+
+
+def test_source_slots_can_be_read_and_saved_audio_can_be_rechecked(tmp_path: Path):
+    WorkflowBackends.transcripts = {}
+    WorkflowBackends.source_transcript = "最初の正確な台本です。"
+    service = ExperimentService(
+        root=tmp_path / "experiments",
+        config=workflow_config(),
+        backends_factory=WorkflowBackends,
+    )
+    source = tmp_path / "source.wav"
+    source_audio(source)
+    experiment_id = service.create_experiment("slots", mode="synthetic")
+    service.save_source(
+        experiment_id, str(source), WorkflowBackends.source_transcript, take=2
+    )
+
+    saved = service.source_recording(experiment_id, 2)
+
+    assert service.source_recording(experiment_id, 1) is None
+    assert saved is not None
+    assert saved["text"] == "最初の正確な台本です。"
+    assert Path(saved["processed_path"]).exists()
+
+    WorkflowBackends.source_transcript = "修正した正確な台本です。"
+    try:
+        result = service.save_source(
+            experiment_id,
+            saved["processed_path"],
+            WorkflowBackends.source_transcript,
+            take=2,
+        )
+        updated = service.source_recording(experiment_id, 2)
+        assert result["quality_ok"]
+        assert updated is not None
+        assert updated["text"] == "修正した正確な台本です。"
+        assert updated["transcript"] == "修正した正確な台本です。"
+    finally:
+        WorkflowBackends.source_transcript = "元音声の正確な台本です。"
+
+    with pytest.raises(ValueError, match="1〜3"):
+        service.source_recording(experiment_id, 4)

@@ -192,6 +192,46 @@ def report_preview(document: str) -> str:
     )
 
 
+def source_recording_status(
+    recording: dict[str, Any] | None,
+    slot: int,
+    *,
+    enabled: bool = True,
+    audio_available: bool = True,
+) -> str:
+    if not enabled:
+        return (
+            "### 元音声スロットは使用しません\n\n"
+            "この実験は全候補を本人が録音する方式です。候補セリフと共通アンカーを収録してください。"
+        )
+    if recording is None:
+        return (
+            f"### ◯ スロット {slot}: 未登録\n\n"
+            "下の「新しい音声」で録音またはファイルを選び、台本を入力して保存してください。"
+        )
+
+    warnings = json.loads(recording["warnings_json"] or "[]")
+    if not audio_available:
+        warnings = [*warnings, "保存済み音声ファイルが見つかりません"]
+    quality_ok = bool(recording["quality_ok"]) and audio_available
+    state = "✅ 登録済み・利用可能" if quality_ok else "⚠️ 登録済み・要再録"
+    transcript = html.escape(str(recording.get("transcript") or "—"))
+    saved_text = html.escape(str(recording["text"]))
+    cer = "—" if recording.get("cer") is None else f"{recording['cer']:.3f}"
+    warning_text = "、".join(html.escape(str(item)) for item in warnings) or "なし"
+    return (
+        f"### {state} — スロット {slot}\n\n"
+        "現在保存されている音声は下のプレイヤーで確認できます。"
+        "再録音する場合は「新しい音声」で録音し、上書きボタンを押してください。\n\n"
+        f"- 保存した台本: {saved_text}\n"
+        f"- ASR: {transcript}\n"
+        f"- 台本CER: {cer}\n"
+        f"- 長さ: {recording['duration']:.2f}秒\n"
+        f"- 推定SNR: {recording['snr_db']:.1f} dB\n"
+        f"- 注意: {warning_text}"
+    )
+
+
 def build_app(service: ExperimentService | None = None) -> gr.Blocks:
     service = service or ExperimentService()
     config = service.config
@@ -243,9 +283,50 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             prompt_card(selected) if selected else ""
         )
 
-    def create_experiment(name: str, mode: str):
+    def source_slot_updates(experiment_id: str | None, slot: int):
+        if not experiment_id:
+            return (
+                gr.update(value=None),
+                gr.update(value=None, interactive=False),
+                gr.update(value="", interactive=False),
+                source_recording_status(None, int(slot), enabled=False),
+                gr.update(value=f"スロット {slot} に保存・台本照合", interactive=False),
+            )
+        experiment = service.db.experiment(experiment_id)
+        enabled = bool(experiment and experiment["mode"] in {"synthetic", "validation"})
+        recording = service.source_recording(experiment_id, int(slot)) if enabled else None
+        audio_path = None
+        audio_available = False
+        if recording:
+            candidate_path = Path(recording["processed_path"])
+            audio_available = candidate_path.exists()
+            if audio_available:
+                audio_path = str(candidate_path)
+        button_text = (
+            f"スロット {slot} を再録音して上書き"
+            if recording
+            else f"スロット {slot} に保存・台本照合"
+        )
+        return (
+            gr.update(value=audio_path),
+            gr.update(value=None, interactive=enabled),
+            gr.update(
+                value=recording["text"] if recording else "",
+                interactive=enabled,
+            ),
+            source_recording_status(
+                recording,
+                int(slot),
+                enabled=enabled,
+                audio_available=audio_available,
+            ),
+            gr.update(value=button_text, interactive=enabled),
+        )
+
+    def create_experiment(name: str, mode: str, source_slot: int):
         experiment_id = service.create_experiment(name, mode=mode)
         candidate_update, candidate_card = experiment_candidate_update(experiment_id)
+        source_updates = source_slot_updates(experiment_id, int(source_slot))
         return (
             gr.update(choices=experiment_choices(), value=experiment_id),
             f"実験を作成しました: `{experiment_id}`",
@@ -253,28 +334,33 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             readiness(experiment_id),
             candidate_update,
             candidate_card,
+            *source_updates,
         )
 
-    def refresh_experiments(current: str | None):
+    def refresh_experiments(current: str | None, source_slot: int):
         choices = experiment_choices()
         values = {value for _, value in choices}
         selected = current if current in values else (choices[0][1] if choices else None)
         candidate_update, candidate_card = experiment_candidate_update(selected)
+        source_updates = source_slot_updates(selected, int(source_slot))
         return (
             gr.update(choices=choices, value=selected),
             recording_table(selected),
             readiness(selected),
             candidate_update,
             candidate_card,
+            *source_updates,
         )
 
-    def change_experiment(experiment_id: str | None):
+    def change_experiment(experiment_id: str | None, source_slot: int):
         candidate_update, candidate_card = experiment_candidate_update(experiment_id)
+        source_updates = source_slot_updates(experiment_id, int(source_slot))
         return (
             recording_table(experiment_id),
             readiness(experiment_id),
             candidate_update,
             candidate_card,
+            *source_updates,
         )
 
     def recording_table(experiment_id: str | None):
@@ -345,25 +431,21 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
     ):
         if not experiment_id:
             raise gr.Error("先に合成事前選定の実験を作成してください")
-        if not audio_path:
-            raise gr.Error("元音声を選択してください")
-        result = service.save_source(
-            experiment_id, audio_path, transcript, take=int(take)
+        existing = service.source_recording(experiment_id, int(take))
+        selected_audio = audio_path
+        if not selected_audio and existing:
+            selected_audio = existing["processed_path"]
+        if not selected_audio:
+            raise gr.Error("元音声を録音または選択してください")
+        service.save_source(
+            experiment_id, selected_audio, transcript, take=int(take)
         )
-        status = (
-            "✅ 元音声を利用できます"
-            if result["quality_ok"]
-            else "⚠️ 元音声または台本を確認してください"
+        source_updates = source_slot_updates(experiment_id, int(take))
+        return (
+            *source_updates,
+            recording_table(experiment_id),
+            readiness(experiment_id),
         )
-        message = (
-            f"{status}\n\n"
-            f"- ASR: {result['transcript']}\n"
-            f"- 台本CER: {result['cer']:.3f}\n"
-            f"- 長さ: {result['duration']:.2f}秒\n"
-            f"- 推定SNR: {result['snr_db']:.1f} dB\n"
-            f"- 注意: {'、'.join(result['warnings']) or 'なし'}"
-        )
-        return message, recording_table(experiment_id), readiness(experiment_id)
 
     def save_anchor(
         experiment_id: str | None,
@@ -696,11 +778,12 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             "レポートを更新しました。下の画面で確認できます。",
         )
 
-    def create_validation(experiment_id: str | None):
+    def create_validation(experiment_id: str | None, source_slot: int):
         if not experiment_id:
             raise gr.Error("合成事前選定の実験を選択してください")
         validation_id = service.create_validation_experiment(experiment_id)
         candidate_update, candidate_card = experiment_candidate_update(validation_id)
+        source_updates = source_slot_updates(validation_id, int(source_slot))
         return (
             gr.update(choices=experiment_choices(), value=validation_id),
             f"上位3件の実録音検証を作成しました: `{validation_id}`",
@@ -708,6 +791,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             readiness(validation_id),
             candidate_update,
             candidate_card,
+            *source_updates,
         )
 
     with gr.Blocks(title="Voice Clone Check") as app:
@@ -757,21 +841,31 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                     source_take = gr.Radio(
                         label="元音声スロット", choices=[1, 2, 3], value=1
                     )
+                    source_quality = gr.Markdown(
+                        source_recording_status(None, 1, enabled=False)
+                    )
+                    saved_source_audio = gr.Audio(
+                        label="現在保存されている元音声",
+                        interactive=False,
+                    )
                     source_transcript = gr.Textbox(
                         label="元音声の正確な台本",
                         lines=3,
                         placeholder="音声で実際に話している内容を一字一句入力",
+                        interactive=False,
                     )
                     source_audio = gr.Audio(
-                        label="元音声",
-                        sources=["upload"],
+                        label="新しい音声（ブラウザで録音またはファイルを選択）",
+                        sources=["microphone", "upload"],
                         type="filepath",
                         format="wav",
+                        interactive=False,
                     )
                     save_source_button = gr.Button(
-                        "元音声を保存・台本照合", variant="primary"
+                        "スロット 1 に保存・台本照合",
+                        variant="primary",
+                        interactive=False,
                     )
-                    source_quality = gr.Markdown()
                 with gr.Row():
                     with gr.Column():
                         gr.Markdown("### 候補セリフ")
@@ -904,7 +998,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
 
         create_button.click(
             create_experiment,
-            inputs=[experiment_name, experiment_mode],
+            inputs=[experiment_name, experiment_mode, source_take],
             outputs=[
                 experiment_select,
                 experiment_message,
@@ -912,27 +1006,53 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 recording_readiness,
                 candidate_select,
                 candidate_prompt,
+                saved_source_audio,
+                source_audio,
+                source_transcript,
+                source_quality,
+                save_source_button,
             ],
         )
         refresh_button.click(
             refresh_experiments,
-            inputs=[experiment_select],
+            inputs=[experiment_select, source_take],
             outputs=[
                 experiment_select,
                 recordings_frame,
                 recording_readiness,
                 candidate_select,
                 candidate_prompt,
+                saved_source_audio,
+                source_audio,
+                source_transcript,
+                source_quality,
+                save_source_button,
             ],
         )
         experiment_select.change(
             change_experiment,
-            inputs=[experiment_select],
+            inputs=[experiment_select, source_take],
             outputs=[
                 recordings_frame,
                 recording_readiness,
                 candidate_select,
                 candidate_prompt,
+                saved_source_audio,
+                source_audio,
+                source_transcript,
+                source_quality,
+                save_source_button,
+            ],
+        )
+        source_take.change(
+            source_slot_updates,
+            inputs=[experiment_select, source_take],
+            outputs=[
+                saved_source_audio,
+                source_audio,
+                source_transcript,
+                source_quality,
+                save_source_button,
             ],
         )
         candidate_select.change(
@@ -963,7 +1083,15 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 source_transcript,
                 source_audio,
             ],
-            outputs=[source_quality, recordings_frame, recording_readiness],
+            outputs=[
+                saved_source_audio,
+                source_audio,
+                source_transcript,
+                source_quality,
+                save_source_button,
+                recordings_frame,
+                recording_readiness,
+            ],
         )
         save_anchor_button.click(
             save_anchor,
@@ -1011,7 +1139,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
         )
         validation_button.click(
             create_validation,
-            inputs=[experiment_select],
+            inputs=[experiment_select, source_take],
             outputs=[
                 experiment_select,
                 experiment_message,
@@ -1019,6 +1147,11 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 recording_readiness,
                 candidate_select,
                 candidate_prompt,
+                saved_source_audio,
+                source_audio,
+                source_transcript,
+                source_quality,
+                save_source_button,
             ],
         )
         load_pair_button.click(
