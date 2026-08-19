@@ -152,6 +152,14 @@ def test_synthetic_screening_and_validation_workflow(tmp_path: Path):
     assert resumed == {"accepted": 0, "rejected": 0, "incomplete": 0}
     assert evaluation == {"completed": 12, "failed": 0, "remaining": 0}
     assert len(service.db.recordings(screening_id, "candidate")) == 6
+    references = service.candidate_references(screening_id)
+    first_reference = service.candidate_reference(
+        screening_id, config.candidates[0].id, 1
+    )
+    assert len(references) == 6
+    assert first_reference is not None
+    assert first_reference["origin"] == "synthetic"
+    assert first_reference["generation_seed"] == 12
 
     validation_id = service.create_validation_experiment(screening_id)
     validation_config = service.experiment_config(validation_id)
@@ -264,3 +272,6 @@ def test_source_slots_can_be_read_and_saved_audio_can_be_rechecked(tmp_path: Pat
 
     with pytest.raises(ValueError, match="1〜3"):
         service.source_recording(experiment_id, 4)
+
+    with pytest.raises(ValueError, match="テイク"):
+        service.candidate_reference(experiment_id, "c01", 3)

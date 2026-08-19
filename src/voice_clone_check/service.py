@@ -108,6 +108,29 @@ class ExperimentService:
             return None
         return dict(row)
 
+    def candidate_reference(
+        self, experiment_id: str, prompt_id: str, take: int
+    ) -> dict[str, Any] | None:
+        config = self.experiment_config(experiment_id)
+        if prompt_id not in {item.id for item in config.candidates}:
+            raise ValueError("この実験に含まれない候補です")
+        if take not in {1, 2}:
+            raise ValueError("候補テイクは1または2で指定してください")
+        row = self.db.recording_slot(
+            experiment_id, "candidate", prompt_id, int(take)
+        )
+        if not row or row["origin"] != "synthetic":
+            return None
+        return dict(row)
+
+    def candidate_references(self, experiment_id: str) -> list[dict[str, Any]]:
+        self.experiment_config(experiment_id)
+        return [
+            dict(row)
+            for row in self.db.recordings(experiment_id, "candidate")
+            if row["origin"] == "synthetic"
+        ]
+
     def save_recording(
         self,
         experiment_id: str,

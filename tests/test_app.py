@@ -3,6 +3,7 @@ from pathlib import Path
 from voice_clone_check.app import (
     CSS,
     build_app,
+    candidate_reference_status,
     report_preview,
     ruby_markup,
     select_listening_pairs,
@@ -39,6 +40,45 @@ def test_source_audio_supports_browser_recording(tmp_path: Path):
     assert source_components[0]["props"]["sources"] == ["microphone", "upload"]
     assert len(saved_components) == 1
     assert not saved_components[0]["props"]["interactive"]
+
+
+def test_app_has_candidate_reference_listening_player(tmp_path: Path):
+    service = ExperimentService(root=tmp_path / "experiments")
+    app = build_app(service)
+    config = app.get_config_file()
+    players = [
+        component
+        for component in config["components"]
+        if component.get("props", {}).get("label") == "選択中の合成候補音声"
+    ]
+
+    assert len(players) == 1
+    assert not players[0]["props"]["interactive"]
+
+
+def test_candidate_reference_status_shows_generation_metadata():
+    recording = {
+        "quality_ok": 1,
+        "warnings_json": "[]",
+        "transcript": "候補音声の認識結果です。",
+        "cer": 0.02,
+        "generation_seed": 9109,
+        "model_id": "test/qwen3-tts",
+        "duration": 5.25,
+        "snr_db": 31.5,
+    }
+
+    status = candidate_reference_status(
+        recording,
+        "候補の文章です。",
+        "c03",
+        2,
+    )
+
+    assert "c03 / テイク 2: 利用可能" in status
+    assert "seed: 9109" in status
+    assert "CER: 0.020" in status
+    assert "候補音声の認識結果です。" in status
 
 
 def test_source_recording_status_describes_empty_saved_and_rerecord_states():

@@ -77,6 +77,9 @@ body.dark {
   margin:8px 0 12px; overflow:hidden; }
 .vcc-listening-progress i { display:block; height:100%;
   background:linear-gradient(90deg,var(--vcc-accent),var(--vcc-accent-end)); }
+.vcc-listen-note { border:1px solid var(--vcc-border); border-radius:14px;
+  padding:14px 16px; background:var(--vcc-surface); color:var(--vcc-ink); }
+.vcc-listen-note p { margin:4px 0; color:var(--vcc-muted); }
 .vcc-report-preview iframe { width:100%; height:min(72vh,760px); min-height:520px;
   border:1px solid var(--vcc-border); border-radius:14px;
   background:var(--vcc-report-surface); }
@@ -232,6 +235,46 @@ def source_recording_status(
     )
 
 
+def candidate_reference_status(
+    recording: dict[str, Any] | None,
+    prompt_text: str,
+    prompt_id: str,
+    take: int,
+    *,
+    audio_available: bool = True,
+) -> str:
+    text = html.escape(prompt_text)
+    if recording is None:
+        return (
+            '<div class="vcc-listen-note">'
+            f"<strong>{html.escape(prompt_id)} / テイク {take}: 未生成</strong>"
+            f"<p>{text}</p>"
+            "<p>「12候補×2テイクを合成」の完了後に、一覧を更新してください。</p>"
+            "</div>"
+        )
+    warnings = json.loads(recording["warnings_json"] or "[]")
+    if not audio_available:
+        warnings = [*warnings, "保存済み音声ファイルが見つかりません"]
+    ready = bool(recording["quality_ok"]) and audio_available
+    state = "利用可能" if ready else "要確認"
+    transcript = html.escape(str(recording.get("transcript") or "—"))
+    cer = "—" if recording.get("cer") is None else f"{recording['cer']:.3f}"
+    seed = recording.get("generation_seed")
+    model = html.escape(str(recording.get("model_id") or "—"))
+    warning_text = "、".join(html.escape(str(item)) for item in warnings) or "なし"
+    return (
+        '<div class="vcc-listen-note">'
+        f"<strong>{html.escape(prompt_id)} / テイク {take}: {state}</strong>"
+        f"<p>{text}</p>"
+        f"<p>seed: {seed if seed is not None else '—'} ／ CER: {cer} ／ "
+        f"長さ: {recording['duration']:.2f}秒 ／ SNR: {recording['snr_db']:.1f} dB</p>"
+        f"<p>ASR: {transcript}</p>"
+        f"<p>モデル: {model}</p>"
+        f"<p>注意: {warning_text}</p>"
+        "</div>"
+    )
+
+
 def build_app(service: ExperimentService | None = None) -> gr.Blocks:
     service = service or ExperimentService()
     config = service.config
@@ -327,6 +370,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
         experiment_id = service.create_experiment(name, mode=mode)
         candidate_update, candidate_card = experiment_candidate_update(experiment_id)
         source_updates = source_slot_updates(experiment_id, int(source_slot))
+        reference_updates = candidate_reference_experiment_updates(experiment_id)
         return (
             gr.update(choices=experiment_choices(), value=experiment_id),
             f"実験を作成しました: `{experiment_id}`",
@@ -335,6 +379,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             candidate_update,
             candidate_card,
             *source_updates,
+            *reference_updates,
         )
 
     def refresh_experiments(current: str | None, source_slot: int):
@@ -343,6 +388,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
         selected = current if current in values else (choices[0][1] if choices else None)
         candidate_update, candidate_card = experiment_candidate_update(selected)
         source_updates = source_slot_updates(selected, int(source_slot))
+        reference_updates = candidate_reference_experiment_updates(selected)
         return (
             gr.update(choices=choices, value=selected),
             recording_table(selected),
@@ -350,17 +396,20 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             candidate_update,
             candidate_card,
             *source_updates,
+            *reference_updates,
         )
 
     def change_experiment(experiment_id: str | None, source_slot: int):
         candidate_update, candidate_card = experiment_candidate_update(experiment_id)
         source_updates = source_slot_updates(experiment_id, int(source_slot))
+        reference_updates = candidate_reference_experiment_updates(experiment_id)
         return (
             recording_table(experiment_id),
             readiness(experiment_id),
             candidate_update,
             candidate_card,
             *source_updates,
+            *reference_updates,
         )
 
     def recording_table(experiment_id: str | None):
@@ -380,6 +429,108 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             ]
             for row in rows
         ]
+
+    def reference_candidate_choices(
+        experiment_id: str | None,
+    ) -> list[tuple[str, str]]:
+        selected_config = (
+            service.experiment_config(experiment_id) if experiment_id else config
+        )
+        return [
+            (f"{item.id} · {item.category}", item.id)
+            for item in selected_config.candidates
+        ]
+
+    def candidate_reference_table(experiment_id: str | None):
+        if not experiment_id:
+            return []
+        experiment = service.db.experiment(experiment_id)
+        if not experiment or experiment["mode"] != "synthetic":
+            return []
+        selected_config = service.experiment_config(experiment_id)
+        saved = {
+            (row["prompt_id"], int(row["take"])): row
+            for row in service.candidate_references(experiment_id)
+        }
+        table = []
+        for prompt in selected_config.candidates:
+            for take in (1, 2):
+                row = saved.get((prompt.id, take))
+                if row is None:
+                    table.append([prompt.id, take, "未生成", "—", "—", "—", "—", "—"])
+                    continue
+                warnings = " / ".join(json.loads(row["warnings_json"])) or "—"
+                table.append(
+                    [
+                        prompt.id,
+                        take,
+                        "利用可能" if row["quality_ok"] else "要確認",
+                        row["generation_seed"] if row["generation_seed"] is not None else "—",
+                        f"{row['duration']:.2f}",
+                        "—" if row["cer"] is None else f"{row['cer']:.3f}",
+                        f"{row['snr_db']:.1f}",
+                        warnings,
+                    ]
+                )
+        return table
+
+    def candidate_reference_view(
+        experiment_id: str | None,
+        prompt_id: str | None,
+        take: int,
+    ):
+        if not experiment_id or not prompt_id:
+            return "", gr.update(value=None), candidate_reference_status(
+                None, "候補を選択してください。", prompt_id or "—", int(take)
+            )
+        experiment = service.db.experiment(experiment_id)
+        selected_config = service.experiment_config(experiment_id)
+        prompts_by_id = {item.id: item for item in selected_config.candidates}
+        prompt = prompts_by_id.get(prompt_id)
+        if prompt is None:
+            prompt = selected_config.candidates[0]
+            prompt_id = prompt.id
+        if not experiment or experiment["mode"] != "synthetic":
+            return (
+                prompt_card(prompt_id),
+                gr.update(value=None),
+                '<div class="vcc-listen-note"><strong>合成候補はありません</strong>'
+                '<p>この実験方式では合成候補音声を使用しません。</p></div>',
+            )
+        recording = service.candidate_reference(experiment_id, prompt_id, int(take))
+        audio_path = None
+        audio_available = False
+        if recording:
+            path = Path(recording["processed_path"])
+            audio_available = path.exists()
+            if audio_available:
+                audio_path = str(path)
+        return (
+            prompt_card(prompt_id),
+            gr.update(value=audio_path),
+            candidate_reference_status(
+                recording,
+                prompt.text,
+                prompt_id,
+                int(take),
+                audio_available=audio_available,
+            ),
+        )
+
+    def candidate_reference_experiment_updates(experiment_id: str | None):
+        choices = reference_candidate_choices(experiment_id)
+        selected = choices[0][1] if choices else None
+        prompt_html, audio_update, status = candidate_reference_view(
+            experiment_id, selected, 1
+        )
+        return (
+            gr.update(choices=choices, value=selected),
+            gr.update(value=1),
+            candidate_reference_table(experiment_id),
+            prompt_html,
+            audio_update,
+            status,
+        )
 
     def readiness(experiment_id: str | None) -> str:
         if not experiment_id:
@@ -784,6 +935,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
         validation_id = service.create_validation_experiment(experiment_id)
         candidate_update, candidate_card = experiment_candidate_update(validation_id)
         source_updates = source_slot_updates(validation_id, int(source_slot))
+        reference_updates = candidate_reference_experiment_updates(validation_id)
         return (
             gr.update(choices=experiment_choices(), value=validation_id),
             f"上位3件の実録音検証を作成しました: `{validation_id}`",
@@ -792,6 +944,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             candidate_update,
             candidate_card,
             *source_updates,
+            *reference_updates,
         )
 
     with gr.Blocks(title="Voice Clone Check") as app:
@@ -942,7 +1095,47 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 )
                 timer = gr.Timer(2.0, active=True)
 
-            with gr.Tab("3. 結果"):
+            with gr.Tab("3. 合成候補の試聴") as reference_listening_tab:
+                gr.Markdown(
+                    "品質検査を通過し、実際の評価に使用される合成候補を試聴できます。候補生成の完了後、このタブを開くか一覧を更新してください。"
+                )
+                reference_refresh_button = gr.Button(
+                    "合成候補の一覧を更新", variant="primary"
+                )
+                reference_table = gr.Dataframe(
+                    headers=[
+                        "候補", "テイク", "状態", "seed", "秒", "CER", "SNR", "注意",
+                    ],
+                    interactive=False,
+                    wrap=True,
+                )
+                with gr.Row():
+                    reference_candidate_select = gr.Dropdown(
+                        label="試聴する候補",
+                        choices=[
+                            (f"{item.id} · {item.category}", item.id)
+                            for item in config.candidates
+                        ],
+                        value=config.candidates[0].id,
+                    )
+                    reference_take = gr.Radio(
+                        label="テイク", choices=[1, 2], value=1
+                    )
+                reference_prompt = gr.HTML(prompt_card(config.candidates[0].id))
+                reference_audio = gr.Audio(
+                    label="選択中の合成候補音声",
+                    interactive=False,
+                )
+                reference_status = gr.HTML(
+                    candidate_reference_status(
+                        None,
+                        config.candidates[0].text,
+                        config.candidates[0].id,
+                        1,
+                    )
+                )
+
+            with gr.Tab("4. 結果"):
                 ranking_cards = gr.HTML("<p>完了データがありません。</p>")
                 with gr.Accordion("ランキング重み", open=False):
                     similarity_weight = gr.Slider(
@@ -968,7 +1161,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                     wrap=True,
                 )
 
-            with gr.Tab("4. ブラインド試聴"):
+            with gr.Tab("5. ブラインド試聴"):
                 listening_message = gr.Markdown(
                     "自動評価の上位3候補を、各評価文につき1回ずつ比較します。"
                 )
@@ -982,7 +1175,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                     vote_tie = gr.Button("同程度")
                     vote_b = gr.Button("B が良い")
 
-            with gr.Tab("5. レポート"):
+            with gr.Tab("6. レポート"):
                 gr.Markdown(
                     "現在の重みと試聴結果でレポートを更新し、この画面に表示します。必要な場合だけ各形式をダウンロードできます。"
                 )
@@ -1011,6 +1204,12 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 source_transcript,
                 source_quality,
                 save_source_button,
+                reference_candidate_select,
+                reference_take,
+                reference_table,
+                reference_prompt,
+                reference_audio,
+                reference_status,
             ],
         )
         refresh_button.click(
@@ -1027,6 +1226,12 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 source_transcript,
                 source_quality,
                 save_source_button,
+                reference_candidate_select,
+                reference_take,
+                reference_table,
+                reference_prompt,
+                reference_audio,
+                reference_status,
             ],
         )
         experiment_select.change(
@@ -1042,6 +1247,12 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 source_transcript,
                 source_quality,
                 save_source_button,
+                reference_candidate_select,
+                reference_take,
+                reference_table,
+                reference_prompt,
+                reference_audio,
+                reference_status,
             ],
         )
         source_take.change(
@@ -1055,6 +1266,40 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 save_source_button,
             ],
         )
+        reference_listening_tab.select(
+            candidate_reference_experiment_updates,
+            inputs=[experiment_select],
+            outputs=[
+                reference_candidate_select,
+                reference_take,
+                reference_table,
+                reference_prompt,
+                reference_audio,
+                reference_status,
+            ],
+        )
+        reference_refresh_button.click(
+            candidate_reference_experiment_updates,
+            inputs=[experiment_select],
+            outputs=[
+                reference_candidate_select,
+                reference_take,
+                reference_table,
+                reference_prompt,
+                reference_audio,
+                reference_status,
+            ],
+        )
+        for component in (reference_candidate_select, reference_take):
+            component.change(
+                candidate_reference_view,
+                inputs=[
+                    experiment_select,
+                    reference_candidate_select,
+                    reference_take,
+                ],
+                outputs=[reference_prompt, reference_audio, reference_status],
+            )
         candidate_select.change(
             select_candidate,
             inputs=[candidate_select],
@@ -1152,6 +1397,12 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 source_transcript,
                 source_quality,
                 save_source_button,
+                reference_candidate_select,
+                reference_take,
+                reference_table,
+                reference_prompt,
+                reference_audio,
+                reference_status,
             ],
         )
         load_pair_button.click(
