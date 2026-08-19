@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import copy
 import json
-import shutil
 import threading
 import time
 import uuid
@@ -10,10 +10,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+import soundfile as sf
 
-from .audio import prepare_recording, sha256_file, valid_audio_file
+from .audio import inspect_audio, prepare_recording, sha256_file, valid_audio_file
 from .backends import ModelBackends, cosine_similarity
-from .config import ExperimentConfig, load_config
+from .config import ExperimentConfig, config_from_raw, load_config
 from .db import Database, now_iso
 from .paths import experiments_root
 from .text_metrics import character_error_rate
@@ -39,18 +40,73 @@ class ExperimentService:
     def experiment_dir(self, experiment_id: str) -> Path:
         return self.root / experiment_id
 
-    def create_experiment(self, name: str | None = None) -> str:
+    def create_experiment(
+        self,
+        name: str | None = None,
+        mode: str = "recorded",
+        parent_experiment_id: str | None = None,
+        candidate_ids: list[str] | None = None,
+    ) -> str:
+        if mode not in {"recorded", "synthetic", "validation"}:
+            raise ValueError("実験モードが不正です")
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         experiment_id = f"{timestamp}-{uuid.uuid4().hex[:6]}"
-        display_name = (name or "").strip() or f"日本語参照セリフ探索 {timestamp}"
+        default_label = {
+            "recorded": "日本語参照セリフ探索",
+            "synthetic": "合成音声による事前選定",
+            "validation": "上位候補の実録音検証",
+        }[mode]
+        display_name = (name or "").strip() or f"{default_label} {timestamp}"
         directory = self.experiment_dir(experiment_id)
-        for child in ("recordings/raw", "recordings/processed", "generated", "reports"):
+        for child in (
+            "recordings/raw", "recordings/processed", "reference_generated",
+            "generated", "reports",
+        ):
             (directory / child).mkdir(parents=True, exist_ok=True)
+        raw_config = copy.deepcopy(self.config.raw)
+        if candidate_ids is not None:
+            selected = set(candidate_ids)
+            raw_config["candidate_prompts"] = [
+                item for item in raw_config["candidate_prompts"]
+                if str(item["id"]) in selected
+            ]
+            if len(raw_config["candidate_prompts"]) != len(selected):
+                raise ValueError("候補IDに不明な値が含まれています")
         config_copy = directory / "config.yaml"
-        source_config = Path(__file__).resolve().parents[2] / "configs" / "default_ja.yaml"
-        shutil.copy2(source_config, config_copy)
-        self.db.create_experiment(experiment_id, display_name, self.config.raw)
+        import yaml
+
+        config_copy.write_text(
+            yaml.safe_dump(raw_config, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        self.db.create_experiment(
+            experiment_id,
+            display_name,
+            raw_config,
+            mode=mode,
+            parent_experiment_id=parent_experiment_id,
+        )
         return experiment_id
+
+    def experiment_config(self, experiment_id: str) -> ExperimentConfig:
+        experiment = self.db.experiment(experiment_id)
+        if not experiment:
+            raise ValueError("実験が見つかりません")
+        return config_from_raw(json.loads(experiment["config_json"]))
+
+    def source_recording(
+        self, experiment_id: str, slot: int
+    ) -> dict[str, Any] | None:
+        if not self.db.experiment(experiment_id):
+            raise ValueError("実験が見つかりません")
+        if slot not in {1, 2, 3}:
+            raise ValueError("元音声スロットは1〜3で指定してください")
+        row = self.db.recording_slot(
+            experiment_id, "anchor", f"source{slot:02d}", 1
+        )
+        if not row or row["origin"] != "source":
+            return None
+        return dict(row)
 
     def save_recording(
         self,
@@ -60,12 +116,21 @@ class ExperimentService:
         take: int,
         text: str,
         source_path: str,
+        *,
+        origin: str = "recorded",
+        model_id: str | None = None,
+        generation_seed: int | None = None,
+        source_sha256: str | None = None,
+        transcript: str | None = None,
+        cer: float | None = None,
+        quality_config: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         if not self.db.experiment(experiment_id):
             raise ValueError("実験が見つかりません")
         if kind not in {"candidate", "anchor"}:
             raise ValueError("録音種別が不正です")
         source = Path(source_path)
+        old = self.db.recording_slot(experiment_id, kind, prompt_id, int(take))
         extension = source.suffix.lower() or ".wav"
         base = f"{kind}_{prompt_id}_t{take}"
         directory = self.experiment_dir(experiment_id)
@@ -75,8 +140,8 @@ class ExperimentService:
             source,
             raw_path,
             processed_path,
-            self.config.sample_rate,
-            self.config.raw["quality"],
+            self.experiment_config(experiment_id).sample_rate,
+            quality_config or self.experiment_config(experiment_id).raw["quality"],
         )
         values = {
             "experiment_id": experiment_id,
@@ -95,14 +160,100 @@ class ExperimentService:
             "snr_db": quality.snr_db,
             "quality_ok": int(quality.quality_ok),
             "warnings_json": json.dumps(quality.warnings, ensure_ascii=False),
+            "origin": origin,
+            "model_id": model_id,
+            "generation_seed": generation_seed,
+            "source_sha256": source_sha256,
+            "transcript": transcript,
+            "cer": cer,
             "created_at": now_iso(),
         }
         recording_id = self.db.upsert_recording(values)
-        if kind == "anchor":
-            self._invalidate_anchor_scores(experiment_id)
-        else:
-            self._invalidate_generation_files(recording_id)
+        changed = not old or old["sha256"] != digest or old["text"] != text
+        if changed:
+            if kind == "anchor":
+                self._invalidate_anchor_scores(experiment_id)
+            else:
+                self._invalidate_generation_files(recording_id)
         return {"recording_id": recording_id, **quality.to_dict(), "sha256": digest}
+
+    def save_source(
+        self,
+        experiment_id: str,
+        source_path: str,
+        transcript: str,
+        take: int = 1,
+    ) -> dict[str, Any]:
+        if self._run_lock.locked():
+            raise RuntimeError("生成または評価の実行中は元音声を変更できません")
+        experiment = self.db.experiment(experiment_id)
+        if not experiment or experiment["mode"] not in {"synthetic", "validation"}:
+            raise ValueError("元音声は合成事前選定または検証実験に登録してください")
+        text = transcript.strip()
+        if not text:
+            raise ValueError("元音声の正確な台本を入力してください")
+        config = self.experiment_config(experiment_id)
+        source_quality = dict(config.raw["quality"])
+        settings = config.candidate_generation
+        source_quality.update(
+            min_seconds=float(settings.get("source_min_seconds", 5.0)),
+            max_seconds=float(settings.get("source_max_seconds", 15.0)),
+        )
+        old = self.db.recording_slot(experiment_id, "anchor", f"source{take:02d}", 1)
+        result = self.save_recording(
+            experiment_id,
+            "anchor",
+            f"source{take:02d}",
+            1,
+            text,
+            source_path,
+            origin="source",
+            quality_config=source_quality,
+        )
+        recording = self.db.recording(int(result["recording_id"]))
+        assert recording is not None
+        backend = self.backends_factory(
+            tts_model_id=config.tts_model,
+            asr_model_id=config.asr_model,
+            speaker_model_id=config.raw["models"]["speaker"],
+            utmos_repo=config.raw["models"]["utmos_repo"],
+            sample_rate=config.sample_rate,
+        )
+        try:
+            recognized = backend.transcribe(recording["processed_path"])
+        finally:
+            backend.release()
+        source_cer = character_error_rate(text, recognized)
+        warnings = list(result["warnings"])
+        max_cer = float(settings.get("source_max_cer", 0.10))
+        if source_cer > max_cer:
+            warnings.append(
+                f"台本と認識結果が一致しません（CER {source_cer:.3f} > {max_cer:.3f}）"
+            )
+        quality_ok = bool(result["quality_ok"]) and source_cer <= max_cer
+        self.db.update_recording_analysis(
+            int(recording["id"]),
+            transcript=recognized,
+            cer=source_cer,
+            quality_ok=quality_ok,
+            warnings=warnings,
+        )
+        changed = (
+            not old
+            or old["sha256"] != result["sha256"]
+            or old["text"] != text
+            or bool(old["quality_ok"]) != quality_ok
+        )
+        if changed and experiment["mode"] == "synthetic":
+            for path in self.db.delete_synthetic_recordings(experiment_id):
+                Path(path).unlink(missing_ok=True)
+        return {
+            **result,
+            "quality_ok": quality_ok,
+            "warnings": warnings,
+            "transcript": recognized,
+            "cer": source_cer,
+        }
 
     def _invalidate_generation_files(self, recording_id: int) -> None:
         with self.db.connect() as connection:
@@ -136,13 +287,226 @@ class ExperimentService:
             "quality_ok": sum(bool(row["quality_ok"]) for row in rows),
         }
 
+    def generate_candidate_references(
+        self,
+        experiment_id: str,
+        smoke: bool = False,
+        progress: ProgressCallback | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, int]:
+        if not self._run_lock.acquire(blocking=False):
+            raise RuntimeError("別の生成または評価が実行中です")
+        try:
+            return self._generate_candidate_references(
+                experiment_id,
+                smoke=smoke,
+                progress=progress,
+                stop_event=stop_event,
+            )
+        finally:
+            self._run_lock.release()
+
+    def _generate_candidate_references(
+        self,
+        experiment_id: str,
+        smoke: bool = False,
+        progress: ProgressCallback | None = None,
+        stop_event: threading.Event | None = None,
+    ) -> dict[str, int]:
+        experiment = self.db.experiment(experiment_id)
+        if not experiment or experiment["mode"] != "synthetic":
+            raise ValueError("合成事前選定の実験を選択してください")
+        config = self.experiment_config(experiment_id)
+        sources = [
+            row for row in self.db.recordings(experiment_id, "anchor")
+            if row["origin"] == "source" and row["quality_ok"]
+        ]
+        if not sources:
+            raise RuntimeError("品質と台本一致を確認済みの元音声が必要です")
+        settings = config.candidate_generation
+        seeds = [int(seed) for seed in settings.get("seeds", config.seeds)]
+        max_attempts = min(int(settings.get("max_attempts", 4)), len(seeds))
+        required_takes = 1 if smoke else int(
+            settings.get("takes_per_candidate", config.takes_per_candidate)
+        )
+        candidates = config.candidates[:1] if smoke else config.candidates
+        model_id = config.smoke_tts_model if smoke else config.tts_model
+        if smoke and any(
+            row["origin"] == "synthetic" and row["model_id"] == config.tts_model
+            for row in self.db.recordings(experiment_id, "candidate")
+        ):
+            return {"accepted": 0, "rejected": 0, "incomplete": 0}
+        backend = self.backends_factory(
+            tts_model_id=model_id,
+            asr_model_id=config.asr_model,
+            speaker_model_id=config.raw["models"]["speaker"],
+            utmos_repo=config.raw["models"]["utmos_repo"],
+            sample_rate=config.sample_rate,
+        )
+        accepted_total = 0
+        rejected_total = 0
+        incomplete = 0
+        total = len(candidates) * max_attempts
+        done = 0
+        self.db.set_experiment_status(experiment_id, "generating_references")
+        try:
+            for candidate in candidates:
+                accepted = [
+                    row for row in self.db.recordings(experiment_id, "candidate")
+                    if row["prompt_id"] == candidate.id
+                    and row["origin"] == "synthetic"
+                    and row["model_id"] == model_id
+                    and row["quality_ok"]
+                    and (row["cer"] is None or row["cer"] <= float(settings.get("max_cer", 0.10)))
+                ]
+                used_seeds = {int(row["generation_seed"]) for row in accepted}
+                for seed in seeds[:max_attempts]:
+                    if len(accepted) >= required_takes:
+                        break
+                    if stop_event and stop_event.is_set():
+                        self.db.set_experiment_status(experiment_id, "paused")
+                        return {
+                            "accepted": accepted_total,
+                            "rejected": rejected_total,
+                            "incomplete": len(candidates),
+                        }
+                    done += 1
+                    source = sources[(done - 1) % len(sources)]
+                    if seed in used_seeds:
+                        continue
+                    existing_attempt = self.db.reference_attempt(
+                        experiment_id, candidate.id, int(source["id"]), seed, model_id
+                    )
+                    if existing_attempt and existing_attempt["status"] == "rejected":
+                        rejected_total += 1
+                        continue
+                    output_path = (
+                        self.experiment_dir(experiment_id)
+                        / "reference_generated"
+                        / f"{candidate.id}_source{source['id']}_s{seed}_{Path(model_id).name}.wav"
+                    )
+                    if progress:
+                        progress(
+                            done - 1,
+                            total,
+                            f"候補参照音声を生成中: {candidate.id} / seed {seed}",
+                        )
+                    try:
+                        if not valid_audio_file(output_path):
+                            backend.synthesize(
+                                text=candidate.text,
+                                ref_audio=source["processed_path"],
+                                ref_text=source["text"],
+                                seed=seed,
+                                output_path=output_path,
+                                max_tokens=int(config.raw["generation"]["max_tokens"]),
+                            )
+                        audio, sample_rate = sf.read(output_path, always_2d=False)
+                        quality = inspect_audio(
+                            np.asarray(audio, dtype=np.float32),
+                            int(sample_rate),
+                            config.raw["quality"],
+                        )
+                        recognized = backend.transcribe(output_path)
+                        cer = character_error_rate(candidate.text, recognized)
+                        max_cer = float(settings.get("max_cer", 0.10))
+                        accepted_ok = quality.quality_ok and cer <= max_cer
+                        attempt_values = {
+                            "experiment_id": experiment_id,
+                            "prompt_id": candidate.id,
+                            "source_recording_id": int(source["id"]),
+                            "seed": seed,
+                            "model_id": model_id,
+                            "output_path": str(output_path),
+                            "status": "accepted" if accepted_ok else "rejected",
+                            "error": None if accepted_ok else "品質またはCERが基準外です",
+                            "duration": quality.duration,
+                            "quality_ok": int(quality.quality_ok),
+                            "transcript": recognized,
+                            "cer": cer,
+                        }
+                        self.db.save_reference_attempt(attempt_values)
+                        if not accepted_ok:
+                            rejected_total += 1
+                            continue
+                        take = len(accepted) + 1
+                        saved = self.save_recording(
+                            experiment_id,
+                            "candidate",
+                            candidate.id,
+                            take,
+                            candidate.text,
+                            str(output_path),
+                            origin="synthetic",
+                            model_id=model_id,
+                            generation_seed=seed,
+                            source_sha256=source["sha256"],
+                            transcript=recognized,
+                            cer=cer,
+                        )
+                        accepted_row = self.db.recording(int(saved["recording_id"]))
+                        if accepted_row is not None:
+                            accepted.append(accepted_row)
+                        used_seeds.add(seed)
+                        accepted_total += 1
+                    except Exception as error:
+                        self.db.save_reference_attempt(
+                            {
+                                "experiment_id": experiment_id,
+                                "prompt_id": candidate.id,
+                                "source_recording_id": int(source["id"]),
+                                "seed": seed,
+                                "model_id": model_id,
+                                "output_path": str(output_path),
+                                "status": "failed",
+                                "error": f"{type(error).__name__}: {error}"[:2000],
+                            }
+                        )
+                        rejected_total += 1
+                if len(accepted) < required_takes:
+                    incomplete += 1
+            self.db.set_experiment_status(
+                experiment_id,
+                "references_ready" if incomplete == 0 else "needs_attention",
+            )
+            if progress:
+                progress(done, total, "候補参照音声の生成が終了しました")
+            return {
+                "accepted": accepted_total,
+                "rejected": rejected_total,
+                "incomplete": incomplete,
+            }
+        finally:
+            backend.release()
+
     def _validate_ready(self, experiment_id: str, smoke: bool) -> list[Any]:
+        experiment = self.db.experiment(experiment_id)
+        if not experiment:
+            raise ValueError("実験が見つかりません")
+        config = self.experiment_config(experiment_id)
         candidates = self.db.recordings(experiment_id, "candidate")
         anchors = self.db.recordings(experiment_id, "anchor")
-        required_candidates = 1 if smoke else len(self.config.candidates) * self.config.takes_per_candidate
-        required_anchors = 1 if smoke else len(self.config.anchors)
-        valid_candidates = [row for row in candidates if row["quality_ok"]]
-        valid_anchors = [row for row in anchors if row["quality_ok"]]
+        required_candidates = 1 if smoke else len(config.candidates) * config.takes_per_candidate
+        required_anchors = 1 if experiment["mode"] in {"synthetic", "validation"} else (
+            1 if smoke else len(config.anchors)
+        )
+        model_id = config.smoke_tts_model if smoke else config.tts_model
+        valid_candidates = [
+            row for row in candidates
+            if row["quality_ok"]
+            and (
+                experiment["mode"] != "synthetic"
+                or (row["origin"] == "synthetic" and row["model_id"] == model_id)
+            )
+        ]
+        valid_anchors = [
+            row for row in anchors
+            if row["quality_ok"]
+            and (
+                experiment["mode"] == "recorded"
+                or row["origin"] == "source"
+            )
+        ]
         if len(valid_candidates) < required_candidates:
             raise RuntimeError(
                 f"品質確認済み候補が不足しています: {len(valid_candidates)}/{required_candidates}"
@@ -154,10 +518,11 @@ class ExperimentService:
         return valid_candidates[:1] if smoke else valid_candidates
 
     def prepare_jobs(self, experiment_id: str, smoke: bool = False) -> int:
+        config = self.experiment_config(experiment_id)
         candidates = self._validate_ready(experiment_id, smoke)
-        evaluations = self.config.evaluations[:1] if smoke else self.config.evaluations
-        seeds = self.config.seeds[:1] if smoke else self.config.seeds
-        model_id = self.config.smoke_tts_model if smoke else self.config.tts_model
+        evaluations = config.evaluations[:1] if smoke else config.evaluations
+        seeds = config.seeds[:1] if smoke else config.seeds
+        model_id = config.smoke_tts_model if smoke else config.tts_model
         return self.db.prepare_generations(
             experiment_id,
             candidates,
@@ -168,8 +533,13 @@ class ExperimentService:
         )
 
     def _anchor_centroid(self, experiment_id: str, backends: ModelBackends) -> np.ndarray:
+        experiment = self.db.experiment(experiment_id)
+        if not experiment:
+            raise ValueError("実験が見つかりません")
         anchors = [
-            row for row in self.db.recordings(experiment_id, "anchor") if row["quality_ok"]
+            row for row in self.db.recordings(experiment_id, "anchor")
+            if row["quality_ok"]
+            and (experiment["mode"] == "recorded" or row["origin"] == "source")
         ]
         embeddings = [
             backends.speaker_embedding(row["processed_path"]) for row in anchors
@@ -192,13 +562,14 @@ class ExperimentService:
             experiment = self.db.experiment(experiment_id)
             if not experiment:
                 raise ValueError("実験が見つかりません")
-            model_id = self.config.smoke_tts_model if smoke else self.config.tts_model
+            config = self.experiment_config(experiment_id)
+            model_id = config.smoke_tts_model if smoke else config.tts_model
             backends = self.backends_factory(
                 tts_model_id=model_id,
-                asr_model_id=self.config.asr_model,
-                speaker_model_id=self.config.raw["models"]["speaker"],
-                utmos_repo=self.config.raw["models"]["utmos_repo"],
-                sample_rate=self.config.sample_rate,
+                asr_model_id=config.asr_model,
+                speaker_model_id=config.raw["models"]["speaker"],
+                utmos_repo=config.raw["models"]["utmos_repo"],
+                sample_rate=config.sample_rate,
             )
             self.db.set_experiment_status(experiment_id, "running")
             pending = self.db.pending_generations(experiment_id, model_id)
@@ -231,7 +602,7 @@ class ExperimentService:
                             ref_text=job["ref_text"],
                             seed=int(job["seed"]),
                             output_path=output_path,
-                            max_tokens=int(self.config.raw["generation"]["max_tokens"]),
+                            max_tokens=int(config.raw["generation"]["max_tokens"]),
                         )
                     output_embedding = backends.speaker_embedding(output_path)
                     similarity = cosine_similarity(anchor_centroid, output_embedding)
@@ -248,7 +619,7 @@ class ExperimentService:
                             "cer": cer,
                             "transcript": transcript,
                             "failed": int(
-                                cer > float(self.config.raw["ranking"]["failure_cer"])
+                                cer > float(config.raw["ranking"]["failure_cer"])
                             ),
                         },
                     )
@@ -268,3 +639,55 @@ class ExperimentService:
             if backends:
                 backends.release()
             self._run_lock.release()
+
+    def create_validation_experiment(
+        self,
+        screening_experiment_id: str,
+        name: str | None = None,
+    ) -> str:
+        screening = self.db.experiment(screening_experiment_id)
+        if not screening or screening["mode"] != "synthetic":
+            raise ValueError("合成事前選定の実験を選択してください")
+        config = self.experiment_config(screening_experiment_id)
+        from .scoring import rank_candidates
+
+        ranking = rank_candidates(
+            [
+                dict(row)
+                for row in self.db.generations(screening_experiment_id, complete_only=True)
+            ],
+            config.raw["ranking"],
+            [dict(row) for row in self.db.votes(screening_experiment_id)],
+            bootstrap_samples=int(config.raw["ranking"]["bootstrap_samples"]),
+        )
+        top_ids = [row["candidate_id"] for row in ranking[:3]]
+        if len(top_ids) < 3:
+            raise RuntimeError("上位3候補を作るには完了済み候補が3件以上必要です")
+        validation_id = self.create_experiment(
+            name=name or f"{screening['name']} — 上位3件の実録音検証",
+            mode="validation",
+            parent_experiment_id=screening_experiment_id,
+            candidate_ids=top_ids,
+        )
+        for source in self.db.recordings(screening_experiment_id, "anchor"):
+            if source["origin"] != "source" or not source["quality_ok"]:
+                continue
+            saved = self.save_recording(
+                validation_id,
+                "anchor",
+                source["prompt_id"],
+                1,
+                source["text"],
+                source["processed_path"],
+                origin="source",
+                transcript=source["transcript"],
+                cer=source["cer"],
+            )
+            self.db.update_recording_analysis(
+                int(saved["recording_id"]),
+                transcript=source["transcript"] or source["text"],
+                cer=float(source["cer"] or 0.0),
+                quality_ok=True,
+                warnings=[],
+            )
+        return validation_id

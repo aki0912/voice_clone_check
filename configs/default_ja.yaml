@@ -11,6 +11,14 @@ generation:
   seeds: [3407, 9109]
   takes_per_candidate: 2
   max_tokens: 2048
+candidate_generation:
+  seeds: [3407, 9109, 2027, 7817]
+  takes_per_candidate: 2
+  max_attempts: 4
+  max_cer: 0.10
+  source_max_cer: 0.10
+  source_min_seconds: 5.0
+  source_max_seconds: 15.0
 quality:
   sample_rate: 24000
   min_seconds: 2.5

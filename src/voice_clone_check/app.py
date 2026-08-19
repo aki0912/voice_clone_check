@@ -192,6 +192,46 @@ def report_preview(document: str) -> str:
     )
 
 
+def source_recording_status(
+    recording: dict[str, Any] | None,
+    slot: int,
+    *,
+    enabled: bool = True,
+    audio_available: bool = True,
+) -> str:
+    if not enabled:
+        return (
+            "### 元音声スロットは使用しません\n\n"
+            "この実験は全候補を本人が録音する方式です。候補セリフと共通アンカーを収録してください。"
+        )
+    if recording is None:
+        return (
+            f"### ◯ スロット {slot}: 未登録\n\n"
+            "下の「新しい音声」で録音またはファイルを選び、台本を入力して保存してください。"
+        )
+
+    warnings = json.loads(recording["warnings_json"] or "[]")
+    if not audio_available:
+        warnings = [*warnings, "保存済み音声ファイルが見つかりません"]
+    quality_ok = bool(recording["quality_ok"]) and audio_available
+    state = "✅ 登録済み・利用可能" if quality_ok else "⚠️ 登録済み・要再録"
+    transcript = html.escape(str(recording.get("transcript") or "—"))
+    saved_text = html.escape(str(recording["text"]))
+    cer = "—" if recording.get("cer") is None else f"{recording['cer']:.3f}"
+    warning_text = "、".join(html.escape(str(item)) for item in warnings) or "なし"
+    return (
+        f"### {state} — スロット {slot}\n\n"
+        "現在保存されている音声は下のプレイヤーで確認できます。"
+        "再録音する場合は「新しい音声」で録音し、上書きボタンを押してください。\n\n"
+        f"- 保存した台本: {saved_text}\n"
+        f"- ASR: {transcript}\n"
+        f"- 台本CER: {cer}\n"
+        f"- 長さ: {recording['duration']:.2f}秒\n"
+        f"- 推定SNR: {recording['snr_db']:.1f} dB\n"
+        f"- 注意: {warning_text}"
+    )
+
+
 def build_app(service: ExperimentService | None = None) -> gr.Blocks:
     service = service or ExperimentService()
     config = service.config
@@ -213,29 +253,114 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
     def select_candidate(prompt_id: str):
         return prompt_card(prompt_id), gr.update(value=1)
 
+    mode_labels = {
+        "recorded": "全候補を実録音",
+        "synthetic": "合成音声で事前選定",
+        "validation": "上位3件を実録音で検証",
+    }
+
     def experiment_choices() -> list[tuple[str, str]]:
         return [
-            (f"{row['name']} · {row['status']}", row["id"])
+            (
+                f"{row['name']} · {mode_labels.get(row['mode'], row['mode'])} · "
+                f"{row['status']}",
+                row["id"],
+            )
             for row in service.db.list_experiments()
         ]
 
-    def create_experiment(name: str):
-        experiment_id = service.create_experiment(name)
+    def candidate_choices(experiment_id: str | None) -> list[tuple[str, str]]:
+        selected_config = service.experiment_config(experiment_id) if experiment_id else config
+        return [
+            (f"{item.id} · {item.category}", item.id)
+            for item in selected_config.candidates
+        ]
+
+    def experiment_candidate_update(experiment_id: str | None):
+        choices = candidate_choices(experiment_id)
+        selected = choices[0][1] if choices else None
+        return gr.update(choices=choices, value=selected), (
+            prompt_card(selected) if selected else ""
+        )
+
+    def source_slot_updates(experiment_id: str | None, slot: int):
+        if not experiment_id:
+            return (
+                gr.update(value=None),
+                gr.update(value=None, interactive=False),
+                gr.update(value="", interactive=False),
+                source_recording_status(None, int(slot), enabled=False),
+                gr.update(value=f"スロット {slot} に保存・台本照合", interactive=False),
+            )
+        experiment = service.db.experiment(experiment_id)
+        enabled = bool(experiment and experiment["mode"] in {"synthetic", "validation"})
+        recording = service.source_recording(experiment_id, int(slot)) if enabled else None
+        audio_path = None
+        audio_available = False
+        if recording:
+            candidate_path = Path(recording["processed_path"])
+            audio_available = candidate_path.exists()
+            if audio_available:
+                audio_path = str(candidate_path)
+        button_text = (
+            f"スロット {slot} を再録音して上書き"
+            if recording
+            else f"スロット {slot} に保存・台本照合"
+        )
+        return (
+            gr.update(value=audio_path),
+            gr.update(value=None, interactive=enabled),
+            gr.update(
+                value=recording["text"] if recording else "",
+                interactive=enabled,
+            ),
+            source_recording_status(
+                recording,
+                int(slot),
+                enabled=enabled,
+                audio_available=audio_available,
+            ),
+            gr.update(value=button_text, interactive=enabled),
+        )
+
+    def create_experiment(name: str, mode: str, source_slot: int):
+        experiment_id = service.create_experiment(name, mode=mode)
+        candidate_update, candidate_card = experiment_candidate_update(experiment_id)
+        source_updates = source_slot_updates(experiment_id, int(source_slot))
         return (
             gr.update(choices=experiment_choices(), value=experiment_id),
             f"実験を作成しました: `{experiment_id}`",
             recording_table(experiment_id),
             readiness(experiment_id),
+            candidate_update,
+            candidate_card,
+            *source_updates,
         )
 
-    def refresh_experiments(current: str | None):
+    def refresh_experiments(current: str | None, source_slot: int):
         choices = experiment_choices()
         values = {value for _, value in choices}
         selected = current if current in values else (choices[0][1] if choices else None)
+        candidate_update, candidate_card = experiment_candidate_update(selected)
+        source_updates = source_slot_updates(selected, int(source_slot))
         return (
             gr.update(choices=choices, value=selected),
             recording_table(selected),
             readiness(selected),
+            candidate_update,
+            candidate_card,
+            *source_updates,
+        )
+
+    def change_experiment(experiment_id: str | None, source_slot: int):
+        candidate_update, candidate_card = experiment_candidate_update(experiment_id)
+        source_updates = source_slot_updates(experiment_id, int(source_slot))
+        return (
+            recording_table(experiment_id),
+            readiness(experiment_id),
+            candidate_update,
+            candidate_card,
+            *source_updates,
         )
 
     def recording_table(experiment_id: str | None):
@@ -259,10 +384,13 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
     def readiness(experiment_id: str | None) -> str:
         if not experiment_id:
             return "実験を作成または選択してください。"
+        selected_config = service.experiment_config(experiment_id)
+        experiment = service.db.experiment(experiment_id)
         counts = service.recording_progress(experiment_id)
-        candidate_goal = len(config.candidates) * config.takes_per_candidate
-        anchor_goal = len(config.anchors)
+        candidate_goal = len(selected_config.candidates) * selected_config.takes_per_candidate
+        anchor_goal = 1 if experiment["mode"] in {"synthetic", "validation"} else len(selected_config.anchors)
         return (
+            f"**方式:** {mode_labels.get(experiment['mode'], experiment['mode'])}　"
             f"**候補:** {counts['candidate']} / {candidate_goal}　"
             f"**アンカー:** {counts['anchor']} / {anchor_goal}　"
             f"**品質OK:** {counts['quality_ok']} / {candidate_goal + anchor_goal}"
@@ -278,16 +406,46 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             raise gr.Error("先に実験を作成してください")
         if not audio_path:
             raise gr.Error("音声を録音または選択してください")
+        selected_candidates = {
+            item.id: item.text
+            for item in service.experiment_config(experiment_id).candidates
+        }
+        if prompt_id not in selected_candidates:
+            raise gr.Error("この実験の候補ではありません")
         result = service.save_recording(
             experiment_id,
             "candidate",
             prompt_id,
             int(take),
-            candidate_text[prompt_id],
+            selected_candidates[prompt_id],
             audio_path,
         )
         message = quality_message(result)
         return message, recording_table(experiment_id), readiness(experiment_id)
+
+    def save_source(
+        experiment_id: str | None,
+        take: int,
+        transcript: str,
+        audio_path: str | None,
+    ):
+        if not experiment_id:
+            raise gr.Error("先に合成事前選定の実験を作成してください")
+        existing = service.source_recording(experiment_id, int(take))
+        selected_audio = audio_path
+        if not selected_audio and existing:
+            selected_audio = existing["processed_path"]
+        if not selected_audio:
+            raise gr.Error("元音声を録音または選択してください")
+        service.save_source(
+            experiment_id, selected_audio, transcript, take=int(take)
+        )
+        source_updates = source_slot_updates(experiment_id, int(take))
+        return (
+            *source_updates,
+            recording_table(experiment_id),
+            readiness(experiment_id),
+        )
 
     def save_anchor(
         experiment_id: str | None,
@@ -298,6 +456,9 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             raise gr.Error("先に実験を作成してください")
         if not audio_path:
             raise gr.Error("音声を録音または選択してください")
+        experiment = service.db.experiment(experiment_id)
+        if experiment["mode"] != "recorded":
+            raise gr.Error("この実験では共通アンカーの代わりに元音声を使用します")
         result = service.save_recording(
             experiment_id,
             "anchor",
@@ -350,6 +511,54 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                     running=False,
                     message=f"エラー: {type(error).__name__}: {error}",
                 )
+
+    def _reference_worker(
+        experiment_id: str, smoke: bool, stop_event: threading.Event
+    ):
+        try:
+            result = service.generate_candidate_references(
+                experiment_id,
+                smoke=smoke,
+                progress=_progress_callback(experiment_id),
+                stop_event=stop_event,
+            )
+            with state_lock:
+                run_state[experiment_id].update(
+                    running=False,
+                    message=(
+                        f"候補参照音声: 新規採用 {result['accepted']}件 / "
+                        f"不採用 {result['rejected']}件 / 未完成候補 {result['incomplete']}件"
+                    ),
+                )
+        except Exception as error:
+            with state_lock:
+                run_state.setdefault(experiment_id, {}).update(
+                    running=False,
+                    message=f"エラー: {type(error).__name__}: {error}",
+                )
+
+    def start_reference_run(experiment_id: str | None, smoke: bool):
+        if not experiment_id:
+            raise gr.Error("実験を選択してください")
+        with state_lock:
+            current = run_state.get(experiment_id)
+            if current and current.get("running"):
+                return "この実験はすでに実行中です。"
+            stop_event = threading.Event()
+            run_state[experiment_id] = {
+                "running": True,
+                "done": 0,
+                "total": 0,
+                "message": "候補参照音声を準備しています",
+                "stop_event": stop_event,
+            }
+        threading.Thread(
+            target=_reference_worker,
+            args=(experiment_id, smoke, stop_event),
+            daemon=True,
+            name=f"vcc-reference-{experiment_id}",
+        ).start()
+        return "候補参照音声の生成を開始しました。"
 
     def start_run(experiment_id: str | None, smoke: bool):
         if not experiment_id:
@@ -416,9 +625,11 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
     ):
         if not experiment_id:
             return [], "<p>実験を選択してください。</p>"
+        selected_config = service.experiment_config(experiment_id)
+        selected_text = {item.id: item.text for item in selected_config.candidates}
         rows = [dict(row) for row in service.db.generations(experiment_id, complete_only=True)]
         votes = [dict(row) for row in service.db.votes(experiment_id)]
-        weights = dict(config.raw["ranking"])
+        weights = dict(selected_config.raw["ranking"])
         weights.update(
             similarity=similarity_weight,
             utmos=utmos_weight,
@@ -436,7 +647,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             [
                 row["rank"],
                 row["candidate_id"],
-                candidate_text.get(row["candidate_id"], ""),
+                selected_text.get(row["candidate_id"], ""),
                 round(row["final_score"], 4),
                 f"{row['ci_low']:.3f}–{row['ci_high']:.3f}",
                 round(row["similarity"], 4),
@@ -451,7 +662,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             (
                 f'<div class="vcc-score"><span>#{row["rank"]} {html.escape(row["candidate_id"])}</span>'
                 f'<strong>{row["final_score"]:.3f}</strong>'
-                f'<span>{html.escape(candidate_text.get(row["candidate_id"], ""))}</span>'
+                f'<span>{html.escape(selected_text.get(row["candidate_id"], ""))}</span>'
                 f'<div class="vcc-bar"><i style="width:{row["final_score"] * 100:.1f}%"></i></div></div>'
             )
             for row in ranking[:3]
@@ -461,8 +672,9 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
     def next_pair(experiment_id: str | None):
         if not experiment_id:
             raise gr.Error("実験を選択してください")
+        selected_config = service.experiment_config(experiment_id)
         rows = [dict(row) for row in service.db.generations(experiment_id, complete_only=True)]
-        weights = config.raw["ranking"]
+        weights = selected_config.raw["ranking"]
         ranking = rank_candidates(rows, weights, (), bootstrap_samples=200)
         top = [row["candidate_id"] for row in ranking[:3]]
         if len(top) < 2:
@@ -479,7 +691,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
         comparisons = select_listening_pairs(
             available_rows,
             top,
-            [evaluation.id for evaluation in config.evaluations],
+            [evaluation.id for evaluation in selected_config.evaluations],
         )
         comparison_keys = [frozenset((a["id"], b["id"])) for a, b in comparisons]
         completed = sum(key in previous for key in comparison_keys)
@@ -488,7 +700,10 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             key = frozenset((a["id"], b["id"]))
             if key in previous:
                 continue
-            evaluation = next(item for item in config.evaluations if item.id == a["eval_id"])
+            evaluation = next(
+                item for item in selected_config.evaluations
+                if item.id == a["eval_id"]
+            )
             swap = (completed + int(a["id"])) % 2 == 1
             if swap:
                 a, b = b, a
@@ -549,9 +764,10 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             "automatic": automatic_weight,
             "listening": 1.0 - automatic_weight,
         }
+        selected_config = service.experiment_config(experiment_id)
         paths = ReportBuilder(
             service.db,
-            config,
+            selected_config,
             service.experiment_dir(experiment_id),
         ).build(experiment_id, weights)
         return (
@@ -560,6 +776,22 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             str(paths["csv"]),
             str(paths["json"]),
             "レポートを更新しました。下の画面で確認できます。",
+        )
+
+    def create_validation(experiment_id: str | None, source_slot: int):
+        if not experiment_id:
+            raise gr.Error("合成事前選定の実験を選択してください")
+        validation_id = service.create_validation_experiment(experiment_id)
+        candidate_update, candidate_card = experiment_candidate_update(validation_id)
+        source_updates = source_slot_updates(validation_id, int(source_slot))
+        return (
+            gr.update(choices=experiment_choices(), value=validation_id),
+            f"上位3件の実録音検証を作成しました: `{validation_id}`",
+            recording_table(validation_id),
+            readiness(validation_id),
+            candidate_update,
+            candidate_card,
+            *source_updates,
         )
 
     with gr.Blocks(title="Voice Clone Check") as app:
@@ -584,6 +816,15 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 placeholder="例: 内蔵マイク・自然な会話調",
                 scale=3,
             )
+            experiment_mode = gr.Dropdown(
+                label="方式",
+                choices=[
+                    ("サンプル音声から事前選定", "synthetic"),
+                    ("全候補を本人が録音", "recorded"),
+                ],
+                value="synthetic",
+                scale=2,
+            )
             create_button = gr.Button("新しい実験を作成", variant="primary", scale=1)
         experiment_message = gr.Markdown(elem_classes="vcc-experiment-message")
 
@@ -591,8 +832,40 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             with gr.Tab("1. 収録"):
                 recording_readiness = gr.Markdown("実験を作成または選択してください。")
                 gr.Markdown(
-                    "マイクとの距離、部屋、声量を揃え、表示文だけを自然な会話調で読んでください。候補は各2テイク、アンカーは各1テイクです。"
+                    "合成事前選定では、最初に元音声と正確な台本を登録します。実録音方式と検証実験では、候補を各2テイク録音します。"
                 )
+                with gr.Accordion("合成事前選定: 元音声を登録", open=True):
+                    gr.Markdown(
+                        "本人の許諾を得た、1人だけが話す5〜15秒の音声を使用してください。ASR結果と台本のCERが0.10以下の場合に利用できます。"
+                    )
+                    source_take = gr.Radio(
+                        label="元音声スロット", choices=[1, 2, 3], value=1
+                    )
+                    source_quality = gr.Markdown(
+                        source_recording_status(None, 1, enabled=False)
+                    )
+                    saved_source_audio = gr.Audio(
+                        label="現在保存されている元音声",
+                        interactive=False,
+                    )
+                    source_transcript = gr.Textbox(
+                        label="元音声の正確な台本",
+                        lines=3,
+                        placeholder="音声で実際に話している内容を一字一句入力",
+                        interactive=False,
+                    )
+                    source_audio = gr.Audio(
+                        label="新しい音声（ブラウザで録音またはファイルを選択）",
+                        sources=["microphone", "upload"],
+                        type="filepath",
+                        format="wav",
+                        interactive=False,
+                    )
+                    save_source_button = gr.Button(
+                        "スロット 1 に保存・台本照合",
+                        variant="primary",
+                        interactive=False,
+                    )
                 with gr.Row():
                     with gr.Column():
                         gr.Markdown("### 候補セリフ")
@@ -650,11 +923,16 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
 
             with gr.Tab("2. 合成・評価"):
                 gr.Markdown(
-                    "初回はモデルを取得します。フル探索は384音声を処理するため長時間かかります。小型モデルによるスモークテストで先に一連の動作を確認できます。"
+                    "合成事前選定では、先に候補参照音声を生成してください。その後、評価音声を生成します。初回はモデルを取得します。"
                 )
                 with gr.Row():
-                    smoke_button = gr.Button("スモークテスト")
-                    full_button = gr.Button("フル探索を開始", variant="primary")
+                    reference_smoke_button = gr.Button("候補生成スモーク")
+                    reference_full_button = gr.Button(
+                        "12候補×2テイクを合成", variant="primary"
+                    )
+                with gr.Row():
+                    smoke_button = gr.Button("評価スモークテスト")
+                    full_button = gr.Button("384件の評価を開始", variant="primary")
                     stop_button = gr.Button("一時停止", variant="stop")
                 run_status = gr.Markdown("未実行")
                 error_table = gr.Dataframe(
@@ -680,6 +958,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                         0, 1, value=0.80, step=0.05, label="自動評価の比率"
                     )
                 ranking_button = gr.Button("ランキングを更新", variant="primary")
+                validation_button = gr.Button("上位3件の実録音検証を作成")
                 ranking_table = gr.Dataframe(
                     headers=[
                         "順位", "候補", "セリフ", "総合", "95% CI",
@@ -719,23 +998,62 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
 
         create_button.click(
             create_experiment,
-            inputs=[experiment_name],
+            inputs=[experiment_name, experiment_mode, source_take],
             outputs=[
                 experiment_select,
                 experiment_message,
                 recordings_frame,
                 recording_readiness,
+                candidate_select,
+                candidate_prompt,
+                saved_source_audio,
+                source_audio,
+                source_transcript,
+                source_quality,
+                save_source_button,
             ],
         )
         refresh_button.click(
             refresh_experiments,
-            inputs=[experiment_select],
-            outputs=[experiment_select, recordings_frame, recording_readiness],
+            inputs=[experiment_select, source_take],
+            outputs=[
+                experiment_select,
+                recordings_frame,
+                recording_readiness,
+                candidate_select,
+                candidate_prompt,
+                saved_source_audio,
+                source_audio,
+                source_transcript,
+                source_quality,
+                save_source_button,
+            ],
         )
         experiment_select.change(
-            lambda value: (recording_table(value), readiness(value)),
-            inputs=[experiment_select],
-            outputs=[recordings_frame, recording_readiness],
+            change_experiment,
+            inputs=[experiment_select, source_take],
+            outputs=[
+                recordings_frame,
+                recording_readiness,
+                candidate_select,
+                candidate_prompt,
+                saved_source_audio,
+                source_audio,
+                source_transcript,
+                source_quality,
+                save_source_button,
+            ],
+        )
+        source_take.change(
+            source_slot_updates,
+            inputs=[experiment_select, source_take],
+            outputs=[
+                saved_source_audio,
+                source_audio,
+                source_transcript,
+                source_quality,
+                save_source_button,
+            ],
         )
         candidate_select.change(
             select_candidate,
@@ -757,10 +1075,38 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             ],
             outputs=[candidate_quality, recordings_frame, recording_readiness],
         )
+        save_source_button.click(
+            save_source,
+            inputs=[
+                experiment_select,
+                source_take,
+                source_transcript,
+                source_audio,
+            ],
+            outputs=[
+                saved_source_audio,
+                source_audio,
+                source_transcript,
+                source_quality,
+                save_source_button,
+                recordings_frame,
+                recording_readiness,
+            ],
+        )
         save_anchor_button.click(
             save_anchor,
             inputs=[experiment_select, anchor_select, anchor_audio],
             outputs=[anchor_quality, recordings_frame, recording_readiness],
+        )
+        reference_smoke_button.click(
+            lambda experiment_id: start_reference_run(experiment_id, True),
+            inputs=[experiment_select],
+            outputs=[run_status],
+        )
+        reference_full_button.click(
+            lambda experiment_id: start_reference_run(experiment_id, False),
+            inputs=[experiment_select],
+            outputs=[run_status],
         )
         smoke_button.click(
             lambda experiment_id: start_run(experiment_id, True),
@@ -790,6 +1136,23 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 automatic_weight,
             ],
             outputs=[ranking_table, ranking_cards],
+        )
+        validation_button.click(
+            create_validation,
+            inputs=[experiment_select, source_take],
+            outputs=[
+                experiment_select,
+                experiment_message,
+                recordings_frame,
+                recording_readiness,
+                candidate_select,
+                candidate_prompt,
+                saved_source_audio,
+                source_audio,
+                source_transcript,
+                source_quality,
+                save_source_button,
+            ],
         )
         load_pair_button.click(
             next_pair,
