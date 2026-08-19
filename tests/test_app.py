@@ -116,6 +116,20 @@ def test_custom_styles_include_readable_dark_mode_tokens_and_buttons():
     assert "background:#fff" not in CSS
 
 
+def test_report_preview_height_grows_with_large_viewports():
+    assert "height:min(72vh,760px)" not in CSS
+    assert "height:calc(100dvh - 260px)" in CSS
+    assert "min-height:520px" in CSS
+
+
+def test_report_preview_stays_centered_in_a_bounded_wide_layout():
+    assert ".gradio-container { width:calc(100% - 32px)" in CSS
+    assert "max-width:1600px" in CSS
+    assert "margin-inline:auto" in CSS
+    assert ".vcc-report-preview { width:100%; }" in CSS
+    assert "transform:translateX(-50%)" not in CSS
+
+
 def test_recording_prompts_have_hiragana_readings():
     config = load_config()
     prompts = {prompt.id: prompt for prompt in config.candidates}

@@ -59,4 +59,7 @@ def test_report_exports_all_formats_without_absolute_audio_paths(tmp_path: Path)
     assert set(paths) == {"csv", "json", "html"}
     assert all(path.exists() for path in paths.values())
     assert str(tmp_path) not in paths["json"].read_text(encoding="utf-8")
-    assert "c01" in paths["html"].read_text(encoding="utf-8")
+    report_html = paths["html"].read_text(encoding="utf-8")
+    assert "c01" in report_html
+    assert "width:calc(100% - 32px)" in report_html
+    assert "width:min(1100px" not in report_html

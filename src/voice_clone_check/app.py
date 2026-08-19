@@ -47,7 +47,9 @@ body.dark {
   --vcc-hero-end: #122925;
   --vcc-focus: #a5b4fc;
 }
-.gradio-container { max-width: 1220px !important; color: var(--vcc-ink); }
+.gradio-container { width:calc(100% - 32px) !important; max-width:1600px !important;
+  margin-inline:auto !important;
+  color:var(--vcc-ink); }
 .vcc-hero { padding: 12px 16px; border-radius: 14px;
   background: linear-gradient(135deg,var(--vcc-hero-start) 0%,
     var(--vcc-hero-middle) 52%,var(--vcc-hero-end) 100%);
@@ -80,7 +82,9 @@ body.dark {
 .vcc-listen-note { border:1px solid var(--vcc-border); border-radius:14px;
   padding:14px 16px; background:var(--vcc-surface); color:var(--vcc-ink); }
 .vcc-listen-note p { margin:4px 0; color:var(--vcc-muted); }
-.vcc-report-preview iframe { width:100%; height:min(72vh,760px); min-height:520px;
+.vcc-report-preview { width:100%; }
+.vcc-report-preview iframe { width:100%; height:calc(100vh - 260px);
+  height:calc(100dvh - 260px); min-height:520px;
   border:1px solid var(--vcc-border); border-radius:14px;
   background:var(--vcc-report-surface); }
 

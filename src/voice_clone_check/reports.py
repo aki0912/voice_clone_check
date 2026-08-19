@@ -25,7 +25,7 @@ REPORT_TEMPLATE = Template(
       --paper:#fff; --wash:#f4f6fb; --accent:#4555d8; --good:#157a62; }
     * { box-sizing:border-box } body { margin:0; color:var(--ink); background:var(--wash);
       font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans JP",sans-serif; }
-    main { width:min(1100px,calc(100% - 32px)); margin:36px auto 72px; }
+    main { width:calc(100% - 32px); margin:36px auto 72px; }
     header,.card { background:var(--paper); border:1px solid var(--line); border-radius:18px;
       box-shadow:0 10px 35px rgba(37,49,91,.06); }
     header { padding:30px 34px; margin-bottom:18px; }
