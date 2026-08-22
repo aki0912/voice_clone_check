@@ -12,7 +12,14 @@ from typing import Any, Callable
 import numpy as np
 import soundfile as sf
 
-from .audio import inspect_audio, prepare_recording, sha256_file, valid_audio_file
+from .audio import (
+    inspect_audio,
+    prepare_recording,
+    sha256_file,
+    suggest_cumulative_boundaries,
+    valid_audio_file,
+    write_cumulative_clips,
+)
 from .backends import ModelBackends, cosine_similarity
 from .config import ExperimentConfig, config_from_raw, load_config
 from .db import Database, now_iso
@@ -47,7 +54,7 @@ class ExperimentService:
         parent_experiment_id: str | None = None,
         candidate_ids: list[str] | None = None,
     ) -> str:
-        if mode not in {"recorded", "synthetic", "validation"}:
+        if mode not in {"recorded", "synthetic", "validation", "duration"}:
             raise ValueError("実験モードが不正です")
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         experiment_id = f"{timestamp}-{uuid.uuid4().hex[:6]}"
@@ -55,6 +62,7 @@ class ExperimentService:
             "recorded": "日本語参照セリフ探索",
             "synthetic": "合成音声による事前選定",
             "validation": "上位候補の実録音検証",
+            "duration": "入力音声長調査",
         }[mode]
         display_name = (name or "").strip() or f"{default_label} {timestamp}"
         directory = self.experiment_dir(experiment_id)
@@ -64,6 +72,17 @@ class ExperimentService:
         ):
             (directory / child).mkdir(parents=True, exist_ok=True)
         raw_config = copy.deepcopy(self.config.raw)
+        if mode == "duration":
+            study = raw_config["duration_study"]
+            raw_config["candidate_prompts"] = [
+                {
+                    "id": str(target["id"]),
+                    "category": "duration",
+                    "text": f"約{float(target['seconds']):g}秒の累積参照音声",
+                }
+                for target in study["targets"]
+            ]
+            raw_config["generation"]["takes_per_candidate"] = len(study["passages"])
         if candidate_ids is not None:
             selected = set(candidate_ids)
             raw_config["candidate_prompts"] = [
@@ -87,6 +106,178 @@ class ExperimentService:
             parent_experiment_id=parent_experiment_id,
         )
         return experiment_id
+
+    def eligible_duration_anchor_experiments(self) -> list[dict[str, Any]]:
+        eligible = []
+        for experiment in self.db.list_experiments():
+            sources = [
+                row for row in self.db.recordings(experiment["id"], "anchor")
+                if row["origin"] == "source" and row["quality_ok"]
+            ]
+            if len(sources) >= 3:
+                eligible.append(dict(experiment))
+        return eligible
+
+    def create_duration_experiment(
+        self, anchor_experiment_id: str | None = None, name: str | None = None
+    ) -> str:
+        if anchor_experiment_id is None:
+            eligible = self.eligible_duration_anchor_experiments()
+            if not eligible:
+                raise RuntimeError("品質確認済み元音声が3本ある実験が必要です")
+            anchor_experiment_id = str(eligible[0]["id"])
+        anchors = [
+            row for row in self.db.recordings(anchor_experiment_id, "anchor")
+            if row["origin"] == "source" and row["quality_ok"]
+        ][:3]
+        if len(anchors) < 3:
+            raise RuntimeError("独立アンカーとして利用できる元音声が3本必要です")
+        experiment_id = self.create_experiment(
+            name=name,
+            mode="duration",
+            parent_experiment_id=anchor_experiment_id,
+        )
+        for index, anchor in enumerate(anchors, start=1):
+            self.save_recording(
+                experiment_id,
+                "anchor",
+                f"source{index:02d}",
+                1,
+                anchor["text"],
+                anchor["processed_path"],
+                origin="source",
+                transcript=anchor["transcript"],
+                cer=anchor["cer"],
+            )
+        return experiment_id
+
+    def duration_study_setup(self, experiment_id: str) -> dict[str, Any]:
+        experiment = self.db.experiment(experiment_id)
+        if not experiment or experiment["mode"] != "duration":
+            raise ValueError("入力音声長調査の実験を選択してください")
+        return copy.deepcopy(self.experiment_config(experiment_id).raw["duration_study"])
+
+    def suggest_duration_boundaries(
+        self, experiment_id: str, source_path: str
+    ) -> dict[str, Any]:
+        settings = self.duration_study_setup(experiment_id)
+        targets = [float(item["seconds"]) for item in settings["targets"]]
+        boundaries, duration = suggest_cumulative_boundaries(
+            source_path,
+            targets,
+            sample_rate=self.experiment_config(experiment_id).sample_rate,
+            search_seconds=float(settings.get("boundary_search_seconds", 1.25)),
+        )
+        return {"boundaries": boundaries, "duration": duration}
+
+    def save_duration_passage(
+        self,
+        experiment_id: str,
+        passage: int,
+        source_path: str,
+        boundaries: list[float] | None = None,
+    ) -> list[dict[str, Any]]:
+        if self._run_lock.locked():
+            raise RuntimeError("評価の実行中は長さ調査音声を変更できません")
+        config = self.experiment_config(experiment_id)
+        settings = self.duration_study_setup(experiment_id)
+        passages = list(settings["passages"])
+        targets = list(settings["targets"])
+        if passage < 1 or passage > len(passages):
+            raise ValueError("調査台本番号が不正です")
+        if boundaries is None:
+            boundaries = self.suggest_duration_boundaries(
+                experiment_id, source_path
+            )["boundaries"]
+        boundaries = [float(value) for value in boundaries]
+        if len(boundaries) != len(targets):
+            raise ValueError("4つの累積境界時刻を指定してください")
+        clip_dir = self.experiment_dir(experiment_id) / "duration_inputs"
+        destinations = [
+            clip_dir / f"p{passage:02d}_{target['id']}.wav"
+            for target in targets
+        ]
+        write_cumulative_clips(
+            source_path,
+            boundaries,
+            destinations,
+            sample_rate=config.sample_rate,
+        )
+        backend = self.backends_factory(
+            tts_model_id=config.tts_model,
+            asr_model_id=config.asr_model,
+            speaker_model_id=config.raw["models"]["speaker"],
+            utmos_repo=config.raw["models"]["utmos_repo"],
+            sample_rate=config.sample_rate,
+        )
+        results = []
+        segments = [str(value) for value in passages[passage - 1]["segments"]]
+        try:
+            for index, (target, clip_path) in enumerate(zip(targets, destinations)):
+                text = "".join(segments[: index + 1])
+                quality = dict(config.raw["quality"])
+                quality.update(
+                    min_seconds=float(target["min_seconds"]),
+                    max_seconds=float(target["max_seconds"]),
+                )
+                result = self.save_recording(
+                    experiment_id,
+                    "candidate",
+                    str(target["id"]),
+                    passage,
+                    text,
+                    str(clip_path),
+                    origin="duration",
+                    quality_config=quality,
+                )
+                recording = self.db.recording(int(result["recording_id"]))
+                assert recording is not None
+                recognized = backend.transcribe(recording["processed_path"])
+                cer = character_error_rate(text, recognized)
+                warnings = list(result["warnings"])
+                max_cer = float(settings.get("max_cer", 0.10))
+                if cer > max_cer:
+                    warnings.append(
+                        f"台本と認識結果が一致しません（CER {cer:.3f} > {max_cer:.3f}）"
+                    )
+                quality_ok = bool(result["quality_ok"]) and cer <= max_cer
+                self.db.update_recording_analysis(
+                    int(recording["id"]),
+                    transcript=recognized,
+                    cer=cer,
+                    quality_ok=quality_ok,
+                    warnings=warnings,
+                )
+                results.append({
+                    **result,
+                    "prompt_id": str(target["id"]),
+                    "take": passage,
+                    "transcript": recognized,
+                    "cer": cer,
+                    "quality_ok": quality_ok,
+                    "warnings": warnings,
+                })
+        finally:
+            backend.release()
+        return results
+
+    def preview_duration_clips(
+        self,
+        experiment_id: str,
+        source_path: str,
+        boundaries: list[float],
+    ) -> list[str]:
+        config = self.experiment_config(experiment_id)
+        self.duration_study_setup(experiment_id)
+        preview_dir = self.experiment_dir(experiment_id) / "duration_preview"
+        destinations = [preview_dir / f"preview_{index}.wav" for index in range(1, 5)]
+        paths = write_cumulative_clips(
+            source_path,
+            [float(value) for value in boundaries],
+            destinations,
+            sample_rate=config.sample_rate,
+        )
+        return [str(path) for path in paths]
 
     def experiment_config(self, experiment_id: str) -> ExperimentConfig:
         experiment = self.db.experiment(experiment_id)

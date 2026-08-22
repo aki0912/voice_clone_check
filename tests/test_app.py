@@ -6,6 +6,7 @@ from voice_clone_check.app import (
     candidate_reference_status,
     report_preview,
     ruby_markup,
+    select_duration_listening_pairs,
     select_listening_pairs,
     source_recording_status,
 )
@@ -54,6 +55,18 @@ def test_app_has_candidate_reference_listening_player(tmp_path: Path):
 
     assert len(players) == 1
     assert not players[0]["props"]["interactive"]
+
+
+def test_app_exposes_duration_recording_and_boundary_preview(tmp_path: Path):
+    app = build_app(ExperimentService(root=tmp_path / "experiments"))
+    config = app.get_config_file()
+    labels = {
+        component.get("props", {}).get("label")
+        for component in config["components"]
+    }
+    assert "長さ調査用の連続音声" in labels
+    assert {"句1 終了秒", "句2 終了秒", "句3 終了秒", "句4 終了秒"} <= labels
+    assert {"約4秒", "約8秒", "約12秒", "約15秒"} <= labels
 
 
 def test_candidate_reference_status_shows_generation_metadata():
@@ -185,6 +198,35 @@ def test_listening_uses_one_generation_per_candidate_pair_and_text():
 
     assert len(pairs) == 6
     assert all(left["take"] == right["take"] == 1 for left, right in pairs)
+    assert all(left["seed"] == right["seed"] == 10 for left, right in pairs)
+
+
+def test_duration_listening_builds_36_matched_adjacent_pairs():
+    rows = [
+        {
+            "id": index,
+            "prompt_id": condition,
+            "eval_id": evaluation,
+            "take": take,
+            "seed": seed,
+        }
+        for index, (condition, evaluation, take, seed) in enumerate(
+            (
+                (condition, evaluation, take, seed)
+                for condition in ("d04", "d08", "d12", "d15")
+                for evaluation in ("e01", "e02", "e03", "e04", "e05")
+                for take in (1, 2, 3)
+                for seed in (10, 20)
+            ),
+            start=1,
+        )
+    ]
+    pairs = select_duration_listening_pairs(
+        rows, ["d04", "d08", "d12", "d15"], ["e01", "e02", "e03", "e04", "e05"]
+    )
+    assert len(pairs) == 36
+    assert all(left["take"] == right["take"] for left, right in pairs)
+    assert all(left["eval_id"] == right["eval_id"] for left, right in pairs)
     assert all(left["seed"] == right["seed"] == 10 for left, right in pairs)
 
 

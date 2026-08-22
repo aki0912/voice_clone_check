@@ -191,6 +191,33 @@ def select_listening_pairs(
     return pairs
 
 
+def select_duration_listening_pairs(
+    rows: list[dict[str, Any]],
+    condition_ids: list[str],
+    evaluation_ids: list[str],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Build 36 matched adjacent-length comparisons (3 takes x 4 texts x 3 pairs)."""
+    selected_evaluations = evaluation_ids[:4]
+    indexed = {
+        (row["prompt_id"], int(row["take"]), row["eval_id"], int(row["seed"])): row
+        for row in rows
+    }
+    seeds = sorted({int(row["seed"]) for row in rows})
+    if not seeds:
+        return []
+    seed = seeds[0]
+    takes = sorted({int(row["take"]) for row in rows})
+    pairs = []
+    for short_id, long_id in zip(condition_ids, condition_ids[1:]):
+        for take in takes:
+            for evaluation_id in selected_evaluations:
+                left = indexed.get((short_id, take, evaluation_id, seed))
+                right = indexed.get((long_id, take, evaluation_id, seed))
+                if left and right:
+                    pairs.append((left, right))
+    return pairs
+
+
 def report_preview(document: str) -> str:
     return (
         '<div class="vcc-report-preview">'
@@ -290,7 +317,12 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
     prompts = {item.id: item for item in (*config.candidates, *config.anchors)}
 
     def prompt_card(prompt_id: str) -> str:
-        prompt = prompts[prompt_id]
+        prompt = prompts.get(prompt_id)
+        if prompt is None:
+            return (
+                '<div class="vcc-prompt"><div class="vcc-prompt-text" lang="ja">'
+                f"{html.escape(str(prompt_id))}</div></div>"
+            )
         return (
             '<div class="vcc-prompt">'
             f'<div class="vcc-prompt-text" lang="ja">{ruby_markup(prompt)}</div>'
@@ -304,6 +336,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
         "recorded": "全候補を実録音",
         "synthetic": "合成音声で事前選定",
         "validation": "上位3件を実録音で検証",
+        "duration": "入力音声長を調査",
     }
 
     def experiment_choices() -> list[tuple[str, str]]:
@@ -370,8 +403,17 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             gr.update(value=button_text, interactive=enabled),
         )
 
-    def create_experiment(name: str, mode: str, source_slot: int):
-        experiment_id = service.create_experiment(name, mode=mode)
+    def create_experiment(
+        name: str, mode: str, source_slot: int, current_experiment: str | None
+    ):
+        if mode == "duration":
+            eligible_ids = {
+                row["id"] for row in service.eligible_duration_anchor_experiments()
+            }
+            anchor_id = current_experiment if current_experiment in eligible_ids else None
+            experiment_id = service.create_duration_experiment(anchor_id, name=name)
+        else:
+            experiment_id = service.create_experiment(name, mode=mode)
         candidate_update, candidate_card = experiment_candidate_update(experiment_id)
         source_updates = source_slot_updates(experiment_id, int(source_slot))
         reference_updates = candidate_reference_experiment_updates(experiment_id)
@@ -829,25 +871,34 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             raise gr.Error("実験を選択してください")
         selected_config = service.experiment_config(experiment_id)
         rows = [dict(row) for row in service.db.generations(experiment_id, complete_only=True)]
-        weights = selected_config.raw["ranking"]
-        ranking = rank_candidates(rows, weights, (), bootstrap_samples=200)
-        top = [row["candidate_id"] for row in ranking[:3]]
-        if len(top) < 2:
-            raise gr.Error("A/B試聴には完了済み候補が2つ以上必要です")
+        experiment = service.db.experiment(experiment_id)
         previous = {
             frozenset((row["generation_a"], row["generation_b"]))
             for row in service.db.votes(experiment_id)
         }
-        available_rows = [
-            row
-            for row in rows
-            if row["prompt_id"] in top and Path(row["output_path"]).exists()
-        ]
-        comparisons = select_listening_pairs(
-            available_rows,
-            top,
-            [evaluation.id for evaluation in selected_config.evaluations],
-        )
+        available_rows = [row for row in rows if Path(row["output_path"]).exists()]
+        if experiment and experiment["mode"] == "duration":
+            condition_ids = [
+                str(item["id"])
+                for item in selected_config.raw["duration_study"]["targets"]
+            ]
+            comparisons = select_duration_listening_pairs(
+                available_rows,
+                condition_ids,
+                [evaluation.id for evaluation in selected_config.evaluations],
+            )
+        else:
+            weights = selected_config.raw["ranking"]
+            ranking = rank_candidates(rows, weights, (), bootstrap_samples=200)
+            top = [row["candidate_id"] for row in ranking[:3]]
+            if len(top) < 2:
+                raise gr.Error("A/B試聴には完了済み候補が2つ以上必要です")
+            available_rows = [row for row in available_rows if row["prompt_id"] in top]
+            comparisons = select_listening_pairs(
+                available_rows,
+                top,
+                [evaluation.id for evaluation in selected_config.evaluations],
+            )
         comparison_keys = [frozenset((a["id"], b["id"])) for a, b in comparisons]
         completed = sum(key in previous for key in comparison_keys)
         total = len(comparisons)
@@ -951,6 +1002,68 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
             *reference_updates,
         )
 
+    def duration_passage_text(experiment_id: str | None, passage: int) -> str:
+        selected = service.experiment_config(experiment_id) if experiment_id else config
+        settings = selected.raw.get("duration_study", {})
+        passages = settings.get("passages", [])
+        if not passages:
+            return "調査台本が設定されていません。"
+        item = passages[int(passage) - 1]
+        lines = [f"### 調査台本 {passage}", "各区切りで短く自然に間を置いてください。"]
+        lines.extend(
+            f"{index}. {segment}" for index, segment in enumerate(item["segments"], start=1)
+        )
+        return "\n\n".join(lines)
+
+    def suggest_duration(
+        experiment_id: str | None, audio_path: str | None
+    ):
+        if not experiment_id or not audio_path:
+            raise gr.Error("長さ調査実験と録音を選択してください")
+        result = service.suggest_duration_boundaries(experiment_id, audio_path)
+        boundaries = result["boundaries"]
+        return (*boundaries, f"録音長 {result['duration']:.2f}秒。無音位置から境界を提案しました。試聴して必要なら調整してください。")
+
+    def save_duration(
+        experiment_id: str | None,
+        passage: int,
+        audio_path: str | None,
+        b1: float,
+        b2: float,
+        b3: float,
+        b4: float,
+    ):
+        if not experiment_id or not audio_path:
+            raise gr.Error("長さ調査実験と録音を選択してください")
+        results = service.save_duration_passage(
+            experiment_id,
+            int(passage),
+            audio_path,
+            [b1, b2, b3, b4],
+        )
+        lines = [f"### 台本 {passage} を4条件に切り出しました"]
+        for result in results:
+            state = "OK" if result["quality_ok"] else "要再録"
+            lines.append(
+                f"- {result['prompt_id']}: {result['duration']:.2f}秒 / "
+                f"CER {result['cer']:.3f} / {state}"
+            )
+        return "\n".join(lines), recording_table(experiment_id), readiness(experiment_id)
+
+    def preview_duration(
+        experiment_id: str | None,
+        audio_path: str | None,
+        b1: float,
+        b2: float,
+        b3: float,
+        b4: float,
+    ):
+        if not experiment_id or not audio_path:
+            raise gr.Error("長さ調査実験と録音を選択してください")
+        return tuple(service.preview_duration_clips(
+            experiment_id, audio_path, [b1, b2, b3, b4]
+        ))
+
     with gr.Blocks(title="Voice Clone Check") as app:
         gr.HTML(
             """
@@ -978,6 +1091,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 choices=[
                     ("サンプル音声から事前選定", "synthetic"),
                     ("全候補を本人が録音", "recorded"),
+                    ("入力音声長を調査", "duration"),
                 ],
                 value="synthetic",
                 scale=2,
@@ -1023,6 +1137,36 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                         variant="primary",
                         interactive=False,
                     )
+                with gr.Accordion("入力音声長調査: 3本の連続音声を登録", open=True):
+                    gr.Markdown(
+                        "長さ調査方式で使用します。15秒前後を連続録音し、各句の終わりの境界を確認して保存してください。"
+                    )
+                    duration_passage = gr.Radio(
+                        label="調査台本", choices=[1, 2, 3], value=1
+                    )
+                    duration_prompt = gr.Markdown(duration_passage_text(None, 1))
+                    duration_audio = gr.Audio(
+                        label="長さ調査用の連続音声",
+                        sources=["microphone", "upload"],
+                        type="filepath",
+                        format="wav",
+                    )
+                    suggest_duration_button = gr.Button("無音位置から境界を提案")
+                    with gr.Row():
+                        duration_b1 = gr.Number(label="句1 終了秒", value=4.0)
+                        duration_b2 = gr.Number(label="句2 終了秒", value=8.0)
+                        duration_b3 = gr.Number(label="句3 終了秒", value=12.0)
+                        duration_b4 = gr.Number(label="句4 終了秒", value=15.0)
+                    preview_duration_button = gr.Button("境界ごとの累積音声を試聴")
+                    with gr.Row():
+                        duration_preview1 = gr.Audio(label="約4秒", interactive=False)
+                        duration_preview2 = gr.Audio(label="約8秒", interactive=False)
+                        duration_preview3 = gr.Audio(label="約12秒", interactive=False)
+                        duration_preview4 = gr.Audio(label="約15秒", interactive=False)
+                    save_duration_button = gr.Button(
+                        "4つの累積参照音声を保存・台本照合", variant="primary"
+                    )
+                    duration_status = gr.Markdown()
                 with gr.Row():
                     with gr.Column():
                         gr.Markdown("### 候補セリフ")
@@ -1089,7 +1233,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                     )
                 with gr.Row():
                     smoke_button = gr.Button("評価スモークテスト")
-                    full_button = gr.Button("384件の評価を開始", variant="primary")
+                    full_button = gr.Button("全件の評価を開始", variant="primary")
                     stop_button = gr.Button("一時停止", variant="stop")
                 run_status = gr.Markdown("未実行")
                 error_table = gr.Dataframe(
@@ -1195,7 +1339,7 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
 
         create_button.click(
             create_experiment,
-            inputs=[experiment_name, experiment_mode, source_take],
+            inputs=[experiment_name, experiment_mode, source_take, experiment_select],
             outputs=[
                 experiment_select,
                 experiment_message,
@@ -1268,6 +1412,35 @@ def build_app(service: ExperimentService | None = None) -> gr.Blocks:
                 source_transcript,
                 source_quality,
                 save_source_button,
+            ],
+        )
+        duration_passage.change(
+            duration_passage_text,
+            inputs=[experiment_select, duration_passage],
+            outputs=[duration_prompt],
+        )
+        suggest_duration_button.click(
+            suggest_duration,
+            inputs=[experiment_select, duration_audio],
+            outputs=[duration_b1, duration_b2, duration_b3, duration_b4, duration_status],
+        )
+        save_duration_button.click(
+            save_duration,
+            inputs=[
+                experiment_select, duration_passage, duration_audio,
+                duration_b1, duration_b2, duration_b3, duration_b4,
+            ],
+            outputs=[duration_status, recordings_frame, recording_readiness],
+        )
+        preview_duration_button.click(
+            preview_duration,
+            inputs=[
+                experiment_select, duration_audio,
+                duration_b1, duration_b2, duration_b3, duration_b4,
+            ],
+            outputs=[
+                duration_preview1, duration_preview2,
+                duration_preview3, duration_preview4,
             ],
         )
         reference_listening_tab.select(

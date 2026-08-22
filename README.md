@@ -60,3 +60,23 @@ uv run voice-clone-check add-candidate --experiment <validation-id> --prompt c01
 - 最終確認: 自動上位3候補の匿名A/B試聴
 
 UTMOSを含む自動指標には限界があります。最終判断では、個別指標、信頼区間、失敗率、ブラインド試聴を合わせて確認してください。
+
+## 入力音声長の調査
+
+新しい実験の方式で「入力音声長を調査」を選ぶと、約4・8・12・15秒の参照音声を対応比較できます。作成時には、品質確認済み元音声が3本ある実験を選択しておいてください。この3本は独立した話者類似度アンカーとして引き継がれます。
+
+1. 3つの固定台本を、それぞれ同じ機材・距離・部屋・話速で連続録音します。各句の終わりで短く自然に間を置きます。
+2. 「無音位置から境界を提案」を押し、約4・8・12・15秒の境界を確認します。「境界ごとの累積音声を試聴」で各切り出しを確認し、必要なら終了秒を調整します。
+3. 各台本を保存すると、累積台本とのASR CER、長さ、SNRなどが検査されます。3台本すべてが品質OKになると12参照音声が揃います。
+4. 「全件の評価を開始」で192件を生成・評価します。中断後も完了済みの結果から再開できます。
+5. ブラインド試聴では隣接する長さを、同じ録音・評価文・seedで揃えた36組で比較します。
+6. レポートには長さ別指標、15秒条件との差、95%信頼区間、推奨最短長または「判定不能」が表示されます。
+
+CLIでも実行できます。
+
+```bash
+uv run voice-clone-check create --mode duration --anchor-experiment <experiment-id> --name "入力長調査"
+uv run voice-clone-check add-duration-passage --experiment <duration-id> --passage 1 --audio passage1.wav
+uv run voice-clone-check run --experiment <duration-id>
+uv run voice-clone-check report --experiment <duration-id>
+```

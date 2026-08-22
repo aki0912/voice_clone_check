@@ -19,6 +19,39 @@ candidate_generation:
   source_max_cer: 0.10
   source_min_seconds: 5.0
   source_max_seconds: 15.0
+duration_study:
+  targets:
+    - {id: d04, seconds: 4.0, min_seconds: 3.0, max_seconds: 5.5}
+    - {id: d08, seconds: 8.0, min_seconds: 7.0, max_seconds: 9.5}
+    - {id: d12, seconds: 12.0, min_seconds: 11.0, max_seconds: 13.5}
+    - {id: d15, seconds: 15.0, min_seconds: 14.0, max_seconds: 16.5}
+  passages:
+    - id: p01
+      segments:
+        - 朝の光が、静かな部屋に入りました。
+        - 窓を開けると、涼しい風が吹きました。
+        - お茶を入れて、今日の予定を確かめます。
+        - 忘れ物を見直して、ゆっくり家を出ます。
+    - id: p02
+      segments:
+        - 七月二十三日、駅前に集まりました。
+        - 青いバスで、第二会議室へ向かいます。
+        - オンライン資料を、順に確認します。
+        - 質問は、担当者にはっきり伝えます。
+    - id: p03
+      segments:
+        - 春の川辺で、小さな鳥が鳴いています。
+        - 赤い橋を渡れば、公園に着きますか？
+        - えっ、間に合ったの、と友人が笑いました。
+        - 柔らかな風の中を、ゆっくり歩きます。
+  max_cer: 0.10
+  boundary_search_seconds: 1.25
+  similarity_margin: 0.02
+  utmos_margin: 0.10
+  cer_margin: 0.02
+  listening_longer_preference_limit: 0.60
+  listening_pairs_per_comparison: 12
+  bootstrap_samples: 2000
 quality:
   sample_rate: 24000
   min_seconds: 2.5

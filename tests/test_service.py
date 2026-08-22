@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 
 import numpy as np
@@ -275,3 +276,65 @@ def test_source_slots_can_be_read_and_saved_audio_can_be_rechecked(tmp_path: Pat
 
     with pytest.raises(ValueError, match="テイク"):
         service.candidate_reference(experiment_id, "c01", 3)
+
+
+class DurationBackends(FakeBackends):
+    def transcribe(self, audio_path):
+        match = re.search(r"candidate_(d\d+)_t(\d+)", str(audio_path))
+        if not match:
+            return "独立アンカー音声です。"
+        condition, take_text = match.groups()
+        settings = load_config().raw["duration_study"]
+        condition_ids = [item["id"] for item in settings["targets"]]
+        segment_count = condition_ids.index(condition) + 1
+        segments = settings["passages"][int(take_text) - 1]["segments"]
+        return "".join(segments[:segment_count])
+
+
+def test_duration_study_creates_12_references_and_192_resumable_jobs(tmp_path: Path):
+    original = load_config()
+    raw = copy.deepcopy(original.raw)
+    raw["quality"].update(min_snr_db=-1.0, max_silence_ratio=1.0)
+    from voice_clone_check.config import config_from_raw
+
+    service = ExperimentService(
+        root=tmp_path / "experiments",
+        config=config_from_raw(raw),
+        backends_factory=DurationBackends,
+    )
+    anchor_experiment = service.create_experiment("anchors", mode="synthetic")
+    anchor_path = tmp_path / "anchor.wav"
+    source_audio(anchor_path)
+    for slot in (1, 2, 3):
+        service.save_recording(
+            anchor_experiment,
+            "anchor",
+            f"source{slot:02d}",
+            1,
+            "独立アンカー音声です。",
+            str(anchor_path),
+            origin="source",
+            transcript="独立アンカー音声です。",
+            cer=0.0,
+        )
+
+    experiment_id = service.create_duration_experiment(anchor_experiment, "duration")
+    duration_path = tmp_path / "duration.wav"
+    sample_rate = 24000
+    time = np.arange(sample_rate * 16) / sample_rate
+    sf.write(duration_path, 0.2 * np.sin(2 * np.pi * 220 * time), sample_rate)
+    for passage in (1, 2, 3):
+        results = service.save_duration_passage(
+            experiment_id,
+            passage,
+            str(duration_path),
+            [4.0, 8.0, 12.0, 15.0],
+        )
+        assert len(results) == 4
+        assert all(result["quality_ok"] and result["cer"] == 0 for result in results)
+
+    assert len(service.db.recordings(experiment_id, "candidate")) == 12
+    assert len(service.db.recordings(experiment_id, "anchor")) == 3
+    assert service.prepare_jobs(experiment_id) == 192
+    assert service.prepare_jobs(experiment_id) == 0
+    assert len(service.db.generations(experiment_id)) == 192

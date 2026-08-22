@@ -10,7 +10,7 @@ from jinja2 import Template
 
 from .config import ExperimentConfig, config_from_raw
 from .db import Database
-from .scoring import rank_candidates
+from .scoring import analyze_duration_study, rank_candidates
 
 
 REPORT_TEMPLATE = Template(
@@ -51,6 +51,59 @@ REPORT_TEMPLATE = Template(
     <p>Qwen3-TTS 日本語参照セリフ探索結果 — {{ mode_label }}</p>
     <p>完了音声 {{ completed }}件 ／ 失敗判定 {{ failed }}件</p>
   </header>
+  {% if duration_analysis %}
+  <section class="card">
+    <h2>入力音声長の比較</h2>
+    {% if duration_analysis.status == 'recommended' %}
+      <p><strong>推奨最短長: 約{{ '%.0f'|format(duration_analysis.recommended_seconds) }}秒</strong></p>
+    {% elif duration_analysis.status == 'needs_listening' %}
+      <p><strong>自動評価上の候補: 約{{ '%.0f'|format(duration_analysis.automatic_candidate_seconds) }}秒</strong> — 最終判定には36件のブラインド試聴を完了してください。</p>
+    {% elif duration_analysis.status == 'inconclusive' %}
+      <p><strong>判定不能:</strong> 信頼区間が判定幅をまたいでいます。録音を追加してください。</p>
+    {% else %}<p>評価データがまだ不足しています。</p>{% endif %}
+    <svg viewBox="0 0 720 230" role="img" aria-label="長さ別話者類似度" style="width:100%;max-width:900px">
+      <line x1="55" y1="190" x2="690" y2="190" stroke="#9aa4b8"/>
+      {% for point in duration_chart %}
+        {% if not loop.first %}<line x1="{{ loop.previtem.x }}" y1="{{ loop.previtem.y }}" x2="{{ point.x }}" y2="{{ point.y }}" stroke="#4555d8" stroke-width="3"/>{% endif %}
+        <circle cx="{{ point.x }}" cy="{{ point.y }}" r="6" fill="#4555d8"/>
+        <text x="{{ point.x }}" y="215" text-anchor="middle">{{ point.seconds|int }}秒</text>
+        <text x="{{ point.x }}" y="{{ point.y - 12 }}" text-anchor="middle">{{ '%.3f'|format(point.value) }}</text>
+      {% endfor %}
+    </svg>
+    <table><thead><tr><th>条件</th><th>件数</th><th>類似度</th><th>UTMOS</th><th>CER</th><th>失敗率</th></tr></thead><tbody>
+      {% for row in duration_analysis.summaries %}<tr>
+        <td>{{ row.condition_id }}（約{{ row.seconds|int }}秒）</td><td>{{ row.samples }}</td>
+        <td>{{ '%.3f'|format(row.similarity) }}</td><td>{{ '%.3f'|format(row.utmos) }}</td>
+        <td>{{ '%.3f'|format(row.cer) }}</td><td>{{ '%.1f%%'|format(row.failure_rate * 100) }}</td>
+      </tr>{% endfor %}
+    </tbody></table>
+    <h2 style="margin-top:24px">録音別の推移</h2>
+    <table><thead><tr><th>録音</th><th>条件</th><th>件数</th><th>類似度</th><th>UTMOS</th><th>CER</th></tr></thead><tbody>
+      {% for row in duration_analysis.block_summaries %}<tr>
+        <td>台本 {{ row.take }}</td><td>{{ row.condition_id }}（約{{ row.seconds|int }}秒）</td><td>{{ row.samples }}</td>
+        <td>{{ '%.3f'|format(row.similarity) }}</td><td>{{ '%.3f'|format(row.utmos) }}</td><td>{{ '%.3f'|format(row.cer) }}</td>
+      </tr>{% endfor %}
+    </tbody></table>
+  </section>
+  <section class="card">
+    <h2>15秒条件との差と95%信頼区間</h2>
+    <table><thead><tr><th>条件</th><th>録音ブロック</th><th>類似度差</th><th>UTMOS差</th><th>CER差</th></tr></thead><tbody>
+      {% for row in duration_analysis.comparisons %}<tr>
+        <td>{{ row.condition_id }}</td><td>{{ row.blocks }}</td>
+        <td>{{ '%.3f'|format(row.similarity_diff) }} [{{ '%.3f'|format(row.similarity_ci_low) }}, {{ '%.3f'|format(row.similarity_ci_high) }}]</td>
+        <td>{{ '%.3f'|format(row.utmos_diff) }} [{{ '%.3f'|format(row.utmos_ci_low) }}, {{ '%.3f'|format(row.utmos_ci_high) }}]</td>
+        <td>{{ '%.3f'|format(row.cer_diff) }} [{{ '%.3f'|format(row.cer_ci_low) }}, {{ '%.3f'|format(row.cer_ci_high) }}]</td>
+      </tr>{% endfor %}
+    </tbody></table>
+    <h2 style="margin-top:24px">隣接長のブラインド試聴</h2>
+    <table><thead><tr><th>比較</th><th>回答数</th><th>長い条件の選好率</th></tr></thead><tbody>
+      {% for row in duration_analysis.adjacent_preferences %}<tr>
+        <td>{{ row.short_id }} 対 {{ row.long_id }}</td><td>{{ row.votes }} / {{ duration_analysis.required_votes_per_comparison }}</td>
+        <td>{{ '未実施' if row.longer_preference is none else '%.1f%%'|format(row.longer_preference * 100) }}</td>
+      </tr>{% endfor %}
+    </tbody></table>
+  </section>
+  {% else %}
   <section class="card">
     <h2>候補ランキング</h2>
     <table><thead><tr>
@@ -69,6 +122,7 @@ REPORT_TEMPLATE = Template(
     {% endfor %}
     </tbody></table>
   </section>
+  {% endif %}
   {% if comparison %}
   <section class="card">
     <h2>合成事前選定との順位比較</h2>
@@ -145,8 +199,28 @@ class ReportBuilder:
             votes,
             bootstrap_samples=int(weights["bootstrap_samples"]),
         )
+        duration_analysis = None
+        duration_chart: list[dict[str, Any]] = []
+        if experiment["mode"] == "duration":
+            duration_analysis = analyze_duration_study(
+                generations,
+                self.config.raw["duration_study"],
+                votes,
+            )
+            points = duration_analysis["summaries"]
+            if points:
+                values = [float(point["similarity"]) for point in points]
+                low, high = min(values), max(values)
+                spread = max(high - low, 0.02)
+                for index, point in enumerate(points):
+                    duration_chart.append({
+                        "x": 80 + index * (580 / max(1, len(points) - 1)),
+                        "y": 180 - (float(point["similarity"]) - low) / spread * 120,
+                        "seconds": point["seconds"],
+                        "value": point["similarity"],
+                    })
         comparison: list[dict[str, Any]] = []
-        if experiment["parent_experiment_id"]:
+        if experiment["parent_experiment_id"] and experiment["mode"] != "duration":
             parent = self.db.experiment(experiment["parent_experiment_id"])
             if parent:
                 parent_config = config_from_raw(json.loads(parent["config_json"]))
@@ -199,6 +273,7 @@ class ReportBuilder:
             "generations": exported_generations,
             "votes": votes,
             "comparison": comparison,
+            "duration_analysis": duration_analysis,
         }
         json_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -237,6 +312,7 @@ class ReportBuilder:
                     "recorded": "全候補を実録音",
                     "synthetic": "合成音声による事前選定",
                     "validation": "上位候補の実録音検証",
+                    "duration": "入力音声長調査",
                 }.get(experiment["mode"], experiment["mode"]),
                 completed=sum(row["status"] == "complete" for row in generations),
                 failed=sum(bool(row["failed"]) for row in generations),
@@ -244,6 +320,8 @@ class ReportBuilder:
                 texts=text_map,
                 clips=clips,
                 comparison=comparison,
+                duration_analysis=duration_analysis,
+                duration_chart=duration_chart,
             ),
             encoding="utf-8",
         )

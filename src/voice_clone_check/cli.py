@@ -28,8 +28,12 @@ def make_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--name")
     create_parser.add_argument(
         "--mode",
-        choices=("synthetic", "recorded"),
+        choices=("synthetic", "recorded", "duration"),
         default="synthetic",
+    )
+    create_parser.add_argument(
+        "--anchor-experiment",
+        help="長さ調査で独立アンカー3本を引き継ぐ実験ID",
     )
 
     run_parser = subparsers.add_parser("run", help="保存済み実験を実行・再開")
@@ -61,6 +65,21 @@ def make_parser() -> argparse.ArgumentParser:
     candidate_parser.add_argument("--take", type=int, choices=(1, 2), required=True)
     candidate_parser.add_argument("--audio", required=True)
 
+    duration_parser = subparsers.add_parser(
+        "add-duration-passage",
+        help="長さ調査用の連続音声を4条件へ切り出して登録",
+    )
+    duration_parser.add_argument("--experiment", required=True)
+    duration_parser.add_argument("--passage", type=int, choices=(1, 2, 3), required=True)
+    duration_parser.add_argument("--audio", required=True)
+    duration_parser.add_argument(
+        "--boundaries",
+        type=float,
+        nargs=4,
+        metavar=("B1", "B2", "B3", "B4"),
+        help="各句の累積終了秒。省略時は無音位置から推定",
+    )
+
     validation_parser = subparsers.add_parser(
         "create-validation",
         help="合成事前選定の上位3件から実録音検証を作成",
@@ -78,7 +97,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     service = ExperimentService()
     if args.command == "create":
-        experiment_id = service.create_experiment(args.name, mode=args.mode)
+        if args.mode == "duration":
+            experiment_id = service.create_duration_experiment(
+                args.anchor_experiment, name=args.name
+            )
+        else:
+            experiment_id = service.create_experiment(args.name, mode=args.mode)
         print(f"実験を作成しました: {experiment_id}")
         return 0
     if args.command == "run":
@@ -110,6 +134,20 @@ def main(argv: list[str] | None = None) -> int:
             f"CER={result['cer']:.3f} ASR={result['transcript']}"
         )
         return 0 if result["quality_ok"] else 1
+    if args.command == "add-duration-passage":
+        results = service.save_duration_passage(
+            args.experiment,
+            args.passage,
+            args.audio,
+            list(args.boundaries) if args.boundaries else None,
+        )
+        for result in results:
+            print(
+                f"{result['prompt_id']}: "
+                f"品質={'OK' if result['quality_ok'] else '要確認'} "
+                f"長さ={result['duration']:.2f}秒 CER={result['cer']:.3f}"
+            )
+        return 0 if all(result["quality_ok"] for result in results) else 1
     if args.command == "add-candidate":
         config = service.experiment_config(args.experiment)
         prompts = {item.id: item for item in config.candidates}
