@@ -147,16 +147,22 @@ def test_recording_prompts_have_hiragana_readings():
     config = load_config()
     prompts = {prompt.id: prompt for prompt in config.candidates}
 
-    assert config.candidates[0].reading == "けさはあおいそらをみながら、えきまでゆっくりあるきました。"
-    assert prompts["c02"].text.endswith("時計がはいっています。")
-    assert prompts["c02"].reading.endswith("とけいがはいっています。")
-    assert prompts["c09"].text.endswith("窓をあけました。")
-    assert prompts["c09"].reading.endswith("まどをあけました。")
+    assert config.candidates[0].reading.startswith(
+        "けさはあおいそらをみながら、えきまでゆっくりあるきました。"
+    )
+    assert config.candidates[0].reading.endswith("よていをしずかにたしかめました。")
+    assert "時計がはいっています。" in prompts["c02"].text
+    assert "とけいがはいっています。" in prompts["c02"].reading
+    assert "窓をあけました。" in prompts["c09"].text
+    assert "まどをあけました。" in prompts["c09"].reading
     assert prompts["c10"].text.startswith("しちがつにじゅうさんにちの")
     assert prompts["c10"].reading.startswith("しちがつにじゅうさんにちの")
     assert "ほそいみち" in prompts["c11"].text
     assert "ほそいみち" in prompts["c11"].reading
     assert config.anchors[0].reading
+
+    punctuation = str.maketrans("", "", "、。？！「」・ ")
+    assert all(len(prompt.reading.translate(punctuation)) >= 60 for prompt in config.candidates)
 
 
 def test_recording_prompts_render_readings_as_ruby():
